@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RehabVR - Therapist Dashboard</title>
+    <style>
+        :root {
+            --primary: #2563eb;
+            --primary-light: #eff6ff;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --dark: #1e293b;
+            --gray: #64748b;
+            --light: #f8fafc;
+            --white: #ffffff;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+        }
+
+        body {
+            background-color: var(--light);
+            color: var(--dark);
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 260px;
+            background: var(--white);
+            border-right: 1px solid #e2e8f0;
+            padding: 1.5rem;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .logo {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: var(--primary);
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            font-size: 0.75rem;
+            color: var(--gray);
+            line-height: 1.2;
+            margin-bottom: 2rem;
+        }
+
+        .nav-item {
+            padding: 0.75rem 1rem;
+            margin-bottom: 0.5rem;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        .nav-item.active {
+            background: var(--primary-light);
+            color: var(--primary);
+        }
+
+        .nav-item:hover:not(.active) {
+            background: var(--light);
+        }
+
+        /* Main Content */
+        .main-content {
+            flex: 1;
+            padding: 2rem;
+            overflow-y: auto;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+
+        .patient-info {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .patient-avatar {
+            width: 50px;
+            height: 50px;
+            background: var(--primary);
+            color: var(--white);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+            font-weight: bold;
+        }
+
+        .status-badge {
+            background: #dcfce7;
+            color: #166534;
+            padding: 0.25rem 0.75rem;
+            border-radius: 1rem;
+            font-size: 0.875rem;
+            font-weight: 600;
+        }
+
+        /* Dashboard Grid */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .card {
+            background: var(--white);
+            padding: 1.5rem;
+            border-radius: 1rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            border: 1px solid #e2e8f0;
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            color: var(--gray);
+            font-size: 0.875rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: var(--dark);
+        }
+
+        .unit {
+            font-size: 1rem;
+            color: var(--gray);
+            font-weight: normal;
+        }
+
+        .trend {
+            font-size: 0.875rem;
+            margin-top: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        .trend.up { color: var(--success); }
+        .trend.neutral { color: var(--warning); }
+
+        /* Wide Cards */
+        .wide-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 1.5rem;
+        }
+
+        .progress-bar-container {
+            width: 100%;
+            height: 8px;
+            background: var(--light);
+            border-radius: 4px;
+            margin-top: 1rem;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: var(--primary);
+            transition: width 0.3s ease;
+        }
+
+        .live-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: var(--success);
+            border-radius: 50%;
+            margin-right: 5px;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+            70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
+        <div>
+            <div class="logo">RehabVR</div>
+            <div class="subtitle">Immersive Motor Rehabilitation System</div>
+        </div>
+        <nav>
+            <div class="nav-item active">Live Session</div>
+            <div class="nav-item">Patient Records</div>
+            <div class="nav-item">Therapy Plans</div>
+            <div class="nav-item">Analytics</div>
+            <div class="nav-item">Hardware Settings</div>
+        </nav>
+    </aside>
+
+    <!-- Main Dashboard -->
+    <main class="main-content">
+        <header class="header">
+            <div class="patient-info">
+                <div class="patient-avatar">JD</div>
+                <div>
+                    <h2>John Doe - Session #12</h2>
+                    <p style="color: var(--gray); font-size: 0.875rem;">Recovering: Post-Stroke Upper Limb Motor Deficit</p>
+                </div>
+                <span class="status-badge"><span class="live-indicator"></span>VR Active</span>
+            </div>
+            <div>
+                <button style="background: var(--primary); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 0.5rem; cursor: pointer; font-weight: 600;">End Session</button>
+            </div>
+        </header>
+
+        <!-- Top Metrics Grid -->
+        <div class="grid">
+            <!-- ROM / Angle -->
+            <div class="card">
+                <div class="card-header">
+                    <span>Range of Motion (Angle)</span>
+                    <span>📐</span>
+                </div>
+                <div class="value" id="val-angle">112<span class="unit">°</span></div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="bar-angle" style="width: 62%;"></div>
+                </div>
+                <div class="trend up">Target: 180° | +15° from last session</div>
+            </div>
+
+            <!-- Force -->
+            <div class="card">
+                <div class="card-header">
+                    <span>Applied Force (Push/Pull)</span>
+                    <span>💪</span>
+                </div>
+                <div class="value" id="val-force">4.2<span class="unit"> kg</span></div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="bar-force" style="width: 42%; background: var(--success);"></div>
+                </div>
+                <div class="trend neutral">Target: 5.0 kg | Stable</div>
+            </div>
+
+            <!-- Grip Pressure -->
+            <div class="card">
+                <div class="card-header">
+                    <span>Haptic Grip Pressure</span>
+                    <span>🖐️</span>
+                </div>
+                <div class="value" id="val-pressure">68<span class="unit">%</span></div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="bar-pressure" style="width: 68%; background: var(--warning);"></div>
+                </div>
+                <div class="trend neutral">Optimal zone: 60-80%</div>
+            </div>
+        </div>
+
+        <!-- Secondary Metrics Grid -->
+        <div class="wide-grid">
+            <div class="card">
+                <div class="card-header">
+                    <span>Spatial Position Tracking (X, Y, Z) & Motion Status</span>
+                    <span>🧭</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem;">
+                    <div>
+                        <div style="color: var(--gray); margin-bottom: 0.25rem;">X-Axis (Lateral)</div>
+                        <div class="value" style="font-size: 1.5rem;" id="val-x">12.4 <span class="unit">cm</span></div>
+                    </div>
+                    <div>
+                        <div style="color: var(--gray); margin-bottom: 0.25rem;">Y-Axis (Vertical)</div>
+                        <div class="value" style="font-size: 1.5rem;" id="val-y">34.1 <span class="unit">cm</span></div>
+                    </div>
+                    <div>
+                        <div style="color: var(--gray); margin-bottom: 0.25rem;">Z-Axis (Depth)</div>
+                        <div class="value" style="font-size: 1.5rem;" id="val-z">-5.2 <span class="unit">cm</span></div>
+                    </div>
+                    <div style="text-align: right;">
+                        <div style="color: var(--gray); margin-bottom: 0.25rem;">Motion State</div>
+                        <div class="status-badge" style="background: var(--primary-light); color: var(--primary);" id="val-motion">Fluid / Active</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span>Exercise Repetitions</span>
+                    <span>🔄</span>
+                </div>
+                <div class="value" style="text-align: center; font-size: 3rem; margin: 0.5rem 0;" id="val-reps">24<span class="unit" style="font-size: 1.5rem;"> / 30</span></div>
+                <div class="trend up" style="justify-content: center;">80% Task Completion</div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Simulated Live Data Script -->
+    <script>
+        // Simulate incoming hardware data from the Haptic Controller
+        setInterval(() => {
+            // Angle simulation
+            const baseAngle = 110;
+            const newAngle = baseAngle + Math.floor(Math.random() * 10) - 5;
+            document.getElementById('val-angle').innerHTML = `${newAngle}<span class="unit">°</span>`;
+            document.getElementById('bar-angle').style.width = `${(newAngle/180)*100}%`;
+
+            // Force simulation
+            const baseForce = 4.0;
+            const newForce = (baseForce + Math.random()).toFixed(1);
+            document.getElementById('val-force').innerHTML = `${newForce}<span class="unit"> kg</span>`;
+            document.getElementById('bar-force').style.width = `${(newForce/10)*100}%`;
+
+            // Pressure simulation
+            const basePressure = 65;
+            const newPressure = basePressure + Math.floor(Math.random() * 8) - 4;
+            document.getElementById('val-pressure').innerHTML = `${newPressure}<span class="unit">%</span>`;
+            document.getElementById('bar-pressure').style.width = `${newPressure}%`;
+
+            // Spatial Coordinates
+            document.getElementById('val-x').innerHTML = `${(12 + Math.random()*2 - 1).toFixed(1)} <span class="unit">cm</span>`;
+            document.getElementById('val-y').innerHTML = `${(34 + Math.random()*2 - 1).toFixed(1)} <span class="unit">cm</span>`;
+            document.getElementById('val-z').innerHTML = `${(-5 + Math.random() - 0.5).toFixed(1)} <span class="unit">cm</span>`;
+
+        }, 800); // Updates every 800ms
+    </script>
+</body>
+</html>

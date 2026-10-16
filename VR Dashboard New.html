@@ -1,0 +1,3245 @@
+<!DOCTYPE html>
+<html lang="en" class="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SAHAAYA | RehabVR - Intelligent Upper-Limb Rehabilitation Platform</title>
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- FontAwesome 6.5.1 CDN -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  
+  <!-- Google Fonts: Plus Jakarta Sans & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.gstatic.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, doc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // Global references for the App
+    window.FirebaseBridge = {
+      initialized: false,
+      db: null,
+      auth: null,
+      activeListeners: [],
+      appId: typeof __app_id !== 'undefined' ? __app_id : 'sahaaya-rehabvr-default',
+      currentSessionId: 'live_session',
+      lastPacketReceivedMs: 0,
+      
+      config: {
+        apiKey: "AIzaSyDLljFQPzWWyf8c3XVlquh6EzlgTyAf8tw",
+        authDomain: "sahaaya-vr.firebaseapp.com",
+        projectId: "sahaaya-vr",
+        storageBucket: "sahaaya-vr.firebasestorage.app",
+        messagingSenderId: "801504753602",
+        appId: "1:801504753602:web:dd5dbbf63cd81aaff2085b",
+        measurementId: "G-0KMNCELRFH"
+      },
+
+      async init() {
+        try {
+          let firebaseConfig = this.config;
+          if (typeof __firebase_config !== 'undefined') {
+            firebaseConfig = JSON.parse(__firebase_config);
+          }
+
+          if (!firebaseConfig.projectId || firebaseConfig.projectId === "YOUR_PROJECT_ID") {
+            updateVRStatusBadge(false, "CONFIG NEEDED");
+            return;
+          }
+
+          const app = initializeApp(firebaseConfig);
+          this.auth = getAuth(app);
+          
+          // Connect explicitly to named database "default", fallback gracefully if needed
+          let dbInstance;
+          try {
+            dbInstance = getFirestore(app, "default");
+          } catch (e) {
+            console.warn("Named database 'default' notice, attempting root:", e);
+            dbInstance = getFirestore(app);
+          }
+          this.db = dbInstance;
+
+          try {
+            await signInAnonymously(this.auth);
+          } catch(authErr) {
+            console.warn("Anonymous auth notice:", authErr.message);
+          }
+
+          this.initialized = true;
+          
+          // Check if a specific session ID was requested in the URL, e.g., ?session=TEST_SESSION_01
+          const urlParams = new URLSearchParams(window.location.search);
+          const requestedSession = urlParams.get('session') || 'live_session';
+          
+          updateVRStatusBadge(false, `WAITING FOR ${requestedSession.toUpperCase()}`);
+          this.subscribeToSession(requestedSession);
+          this.startHeartbeatMonitor();
+        } catch (err) {
+          console.warn("Firebase initialization notice:", err.message);
+          updateVRStatusBadge(false, "LOCAL SIMULATION");
+        }
+      },
+
+      subscribeToSession(sessionId = 'live_session') {
+        if (!this.initialized || !this.db) return;
+        this.currentSessionId = sessionId;
+        
+        // Update Doctor session dropdown selection if present
+        const sSelect = document.getElementById('docSessionSelect');
+        if (sSelect) {
+          let found = false;
+          for (let i = 0; i < sSelect.options.length; i++) {
+            if (sSelect.options[i].value === sessionId) {
+              sSelect.selectedIndex = i;
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            const opt = document.createElement('option');
+            opt.value = sessionId;
+            opt.text = `${sessionId} (External)`;
+            opt.className = "bg-white dark:bg-slate-900 text-slate-900 dark:text-white";
+            sSelect.add(opt);
+            sSelect.value = sessionId;
+          }
+        }
+
+        // Clear existing listeners
+        this.activeListeners.forEach(unsub => {
+          try { unsub(); } catch(e) {}
+        });
+        this.activeListeners = [];
+
+        // Attach listener helper that does NOT kill itself on transient warnings
+        const attachDocListener = (docRef, label) => {
+          try {
+            const unsub = onSnapshot(docRef, (docSnap) => {
+              if (docSnap.exists()) {
+                const data = docSnap.data();
+                this.lastPacketReceivedMs = Date.now();
+                if (window.handleRemoteVRPacket) {
+                  window.handleRemoteVRPacket(data);
+                }
+              }
+            }, (err) => {
+              console.warn(`Telemetry stream [${label}] notice:`, err.message);
+            });
+            this.activeListeners.push(unsub);
+          } catch (e) {
+            console.warn(`Could not attach [${label}] listener:`, e.message);
+          }
+        };
+
+        // 1. Listen to the primary requested session
+        if (sessionId !== 'live_session') {
+          const sessionRef = doc(this.db, 'artifacts', this.appId, 'public', 'data', 'patient_sessions', sessionId);
+          attachDocListener(sessionRef, sessionId);
+        }
+
+        // 2. Also listen to live_session so either path works immediately
+        const liveRef = doc(this.db, 'artifacts', this.appId, 'public', 'data', 'telemetry', 'live_session');
+        attachDocListener(liveRef, 'live_session');
+      },
+
+      // Freshness Watchdog: checks if Quest headset stopped transmitting in last 3.5s
+      startHeartbeatMonitor() {
+        setInterval(() => {
+          if (!this.lastPacketReceivedMs) return;
+          const timeSinceLastPacket = Date.now() - this.lastPacketReceivedMs;
+          if (timeSinceLastPacket > 3500) {
+            const secsAgo = (timeSinceLastPacket / 1000).toFixed(1);
+            updateVRStatusBadge(false, `SIGNAL STALE (${secsAgo}s AGO)`);
+          }
+        }, 1000);
+      }
+    };
+
+    window.handleSessionDropdownChange = function(selectedSession) {
+      if (selectedSession && window.FirebaseBridge) {
+        window.FirebaseBridge.subscribeToSession(selectedSession.trim());
+        showToast("Switched Target Session", `Now streaming: ${selectedSession.trim()}`, "fa-satellite-dish");
+      }
+    };
+
+    window.switchActiveSession = function(sessionId) {
+      if (!sessionId) {
+        sessionId = prompt("Enter Target Session ID to Monitor (e.g., TEST_SESSION_01 or live_session):", window.FirebaseBridge.currentSessionId);
+      }
+      if (sessionId && window.FirebaseBridge) {
+        window.FirebaseBridge.subscribeToSession(sessionId.trim());
+        showToast("Switched Target Session", `Now streaming: ${sessionId.trim()}`, "fa-satellite-dish");
+      }
+    };
+
+    window.addEventListener('load', () => {
+      window.FirebaseBridge.init();
+    });
+  </script>
+  
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Plus Jakarta Sans', 'system-ui', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+          colors: {
+            neon: {
+              cyan: '#06b6d4',
+              blue: '#2563eb',
+              violet: '#7c3aed',
+              emerald: '#059669',
+              amber: '#d97706',
+              rose: '#e11d48'
+            }
+          },
+          animation: {
+            'aurora-glow': 'auroraLight 18s ease-in-out infinite alternate',
+            'pulse-gentle': 'pulseGentle 3s ease-in-out infinite',
+            'scanline': 'scanline 4s linear infinite',
+            'float-slow': 'floatingHero 6s ease-in-out infinite',
+          },
+          keyframes: {
+            auroraLight: {
+              '0%': { transform: 'translate(0%, 0%) rotate(0deg) scale(1)' },
+              '50%': { transform: 'translate(6%, -6%) rotate(6deg) scale(1.1)' },
+              '100%': { transform: 'translate(-6%, 6%) rotate(-6deg) scale(0.95)' },
+            },
+            pulseGentle: {
+              '0%, 100%': { opacity: '0.6' },
+              '50%': { opacity: '1' }
+            },
+            scanline: {
+              '0%': { transform: 'translateY(-100%)' },
+              '100%': { transform: 'translateY(1000%)' }
+            },
+            floatingHero: {
+              '0%, 100%': { transform: 'translateY(0px)' },
+              '50%': { transform: 'translateY(-8px)' }
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <style>
+    * {
+      box-sizing: border-box;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    
+    body {
+      background-color: #f8fafc;
+      color: #0f172a;
+      overflow-x: hidden;
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      transition: background-color 0.3s ease, color 0.3s ease;
+    }
+
+    html.dark body {
+      background-color: #030712;
+      color: #f1f5f9;
+    }
+
+    .screen-noise {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)' opacity='0.02'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 999;
+      opacity: 0.6;
+    }
+
+    .ambient-mesh {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+      overflow: hidden;
+      background: radial-gradient(circle at 50% 0%, #e0f2fe 0%, #f8fafc 75%);
+      transition: background 0.4s ease;
+    }
+
+    html.dark .ambient-mesh {
+      background: radial-gradient(circle at 50% 0%, #0c1a30 0%, #030712 80%);
+    }
+
+    .orb {
+      position: absolute;
+      border-radius: 9999px;
+      filter: blur(110px);
+      pointer-events: none;
+      mix-blend-mode: multiply;
+      opacity: 0.6;
+    }
+
+    html.dark .orb {
+      mix-blend-mode: screen;
+      opacity: 0.35;
+    }
+
+    .orb-cyan {
+      width: 580px;
+      height: 580px;
+      background: radial-gradient(circle, rgba(6, 182, 212, 0.55) 0%, rgba(6, 182, 212, 0) 70%);
+      top: -10%;
+      left: 10%;
+      animation: auroraLight 16s ease-in-out infinite alternate;
+    }
+
+    .orb-violet {
+      width: 650px;
+      height: 650px;
+      background: radial-gradient(circle, rgba(147, 51, 234, 0.45) 0%, rgba(147, 51, 234, 0) 70%);
+      bottom: 5%;
+      right: 5%;
+      animation: auroraLight 20s ease-in-out infinite alternate-reverse;
+    }
+
+    .orb-emerald {
+      width: 480px;
+      height: 480px;
+      background: radial-gradient(circle, rgba(16, 185, 129, 0.4) 0%, rgba(16, 185, 129, 0) 70%);
+      top: 35%;
+      left: 45%;
+      animation: auroraLight 14s ease-in-out infinite alternate;
+    }
+
+    #cursorLight {
+      position: fixed;
+      width: 450px;
+      height: 450px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(6, 182, 212, 0.12) 0%, transparent 70%);
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      z-index: 1;
+      transition: width 0.2s, height 0.2s;
+    }
+
+    .cyber-grid {
+      background-image: 
+        linear-gradient(to right, rgba(15, 23, 42, 0.05) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(15, 23, 42, 0.05) 1px, transparent 1px);
+      background-size: 40px 40px;
+    }
+
+    html.dark .cyber-grid {
+      background-image: 
+        linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+    }
+
+    .glass-base {
+      background: rgba(255, 255, 255, 0.88);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid rgba(226, 232, 240, 0.9);
+      box-shadow: 0 12px 35px -8px rgba(15, 23, 42, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    }
+
+    html.dark .glass-base {
+      background: rgba(11, 20, 38, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      box-shadow: 0 20px 50px -15px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    }
+
+    .glass-card-portal-doc {
+      background: linear-gradient(135deg, rgba(255, 255, 255, 0.95) 0%, rgba(240, 249, 255, 0.9) 100%);
+      backdrop-filter: blur(24px);
+      border: 2px solid rgba(6, 182, 212, 0.35);
+      box-shadow: 0 20px 45px -12px rgba(6, 182, 212, 0.18), 0 0 0 1px rgba(6, 182, 212, 0.2);
+    }
+
+    .glass-card-portal-doc:hover {
+      border-color: rgba(6, 182, 212, 0.85);
+      box-shadow: 0 25px 55px -10px rgba(6, 182, 212, 0.3), 0 0 25px rgba(6, 182, 212, 0.2);
+    }
+
+    .glass-card-portal-pat {
+      background: linear-gradient(135deg, rgba(255, 255, 255, 0.95) 0%, rgba(250, 245, 255, 0.9) 100%);
+      backdrop-filter: blur(24px);
+      border: 2px solid rgba(147, 51, 234, 0.35);
+      box-shadow: 0 20px 45px -12px rgba(147, 51, 234, 0.18), 0 0 0 1px rgba(147, 51, 234, 0.2);
+    }
+
+    .glass-card-portal-pat:hover {
+      border-color: rgba(147, 51, 234, 0.85);
+      box-shadow: 0 25px 55px -10px rgba(147, 51, 234, 0.3), 0 0 25px rgba(147, 51, 234, 0.2);
+    }
+
+    html.dark .glass-card-portal-doc {
+      background: linear-gradient(135deg, rgba(15, 29, 58, 0.85) 0%, rgba(6, 14, 30, 0.95) 100%);
+      border: 1px solid rgba(6, 182, 212, 0.4);
+    }
+
+    html.dark .glass-card-portal-pat {
+      background: linear-gradient(135deg, rgba(28, 22, 58, 0.85) 0%, rgba(12, 10, 34, 0.95) 100%);
+      border: 1px solid rgba(147, 51, 234, 0.4);
+    }
+
+    .portal-perspective {
+      perspective: 1800px;
+    }
+
+    @keyframes flyInCamera {
+      0% {
+        opacity: 0;
+        transform: perspective(1400px) translateZ(-650px) translateY(70px) rotateX(16deg) scale(0.85);
+        filter: blur(14px);
+      }
+      60% {
+        opacity: 1;
+        filter: blur(0px);
+        transform: perspective(1400px) translateZ(30px) translateY(-8px) rotateX(-2deg) scale(1.02);
+      }
+      100% {
+        opacity: 1;
+        transform: perspective(1400px) translateZ(0px) translateY(0px) rotateX(0deg) scale(1);
+      }
+    }
+
+    @keyframes flyInPortalDoc {
+      0% {
+        opacity: 0;
+        transform: perspective(1200px) translateX(-140px) translateZ(-300px) rotateY(22deg) rotateX(8deg);
+      }
+      100% {
+        opacity: 1;
+        transform: perspective(1200px) translateX(0) translateZ(0) rotateY(0deg) rotateX(0deg);
+      }
+    }
+
+    @keyframes flyInPortalPat {
+      0% {
+        opacity: 0;
+        transform: perspective(1200px) translateX(140px) translateZ(-300px) rotateY(-22deg) rotateX(8deg);
+      }
+      100% {
+        opacity: 1;
+        transform: perspective(1200px) translateX(0) translateZ(0) rotateY(0deg) rotateX(0deg);
+      }
+    }
+
+    .flying-hero-enter {
+      animation: flyInCamera 1.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+      will-change: transform, opacity, filter;
+    }
+
+    .flying-card-doc {
+      animation: flyInPortalDoc 1.5s cubic-bezier(0.16, 1, 0.3, 1) 0.25s forwards;
+      opacity: 0;
+      will-change: transform, opacity;
+    }
+
+    .flying-card-pat {
+      animation: flyInPortalPat 1.5s cubic-bezier(0.16, 1, 0.3, 1) 0.35s forwards;
+      opacity: 0;
+      will-change: transform, opacity;
+    }
+
+    .tilt-card {
+      transform-style: preserve-3d;
+      transition: transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 0.35s ease, border-color 0.3s ease;
+      will-change: transform;
+    }
+
+    .cinematic-ring {
+      position: absolute;
+      border-radius: 9999px;
+      border: 1.5px solid rgba(6, 182, 212, 0.35);
+      pointer-events: none;
+      animation: pulseRings 2.8s ease-out infinite;
+    }
+
+    @keyframes pulseRings {
+      0% {
+        transform: scale(0.65) rotate(0deg);
+        opacity: 0.8;
+      }
+      100% {
+        transform: scale(1.45) rotate(90deg);
+        opacity: 0;
+      }
+    }
+
+    .view-fade {
+      transition: opacity 0.35s cubic-bezier(0.4, 0, 0.2, 1), transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .view-hidden {
+      display: none !important;
+      opacity: 0;
+      transform: translateY(14px) scale(0.985);
+    }
+    .view-visible {
+      display: block;
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col font-sans relative">
+
+  <div class="screen-noise"></div>
+
+  <div class="ambient-mesh">
+    <div class="orb orb-cyan"></div>
+    <div class="orb orb-violet"></div>
+    <div class="orb orb-emerald"></div>
+    <div class="absolute inset-0 cyber-grid opacity-80"></div>
+  </div>
+
+  <div id="cursorLight"></div>
+
+  <header class="sticky top-0 z-50 w-full glass-base border-b border-slate-200/90 dark:border-slate-800/80 px-4 sm:px-6 lg:px-8 py-3.5 transition-all">
+    <div class="max-w-7xl mx-auto flex items-center justify-between">
+      
+      <div class="flex items-center space-x-3.5 cursor-pointer group" onclick="switchView('landing')">
+        <div class="relative w-11 h-11 rounded-2xl bg-gradient-to-tr from-cyan-500 via-blue-600 to-indigo-600 flex items-center justify-center shadow-lg shadow-cyan-500/30 group-hover:scale-105 transition-transform duration-300">
+          <i class="fa-solid fa-vr-cardboard text-white text-xl font-black"></i>
+          <span class="absolute -top-1 -right-1 flex h-3.5 w-3.5">
+            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+            <span class="relative inline-flex rounded-full h-3.5 w-3.5 bg-emerald-500 border-2 border-white dark:border-slate-900"></span>
+          </span>
+        </div>
+        <div>
+          <div class="flex items-center space-x-2">
+            <span class="text-xl sm:text-2xl font-black tracking-tight text-slate-900 dark:text-white">SAHAAYA</span>
+            <span class="text-xs px-2.5 py-0.5 rounded-md bg-cyan-100 dark:bg-cyan-950 border border-cyan-500/50 text-cyan-700 dark:text-cyan-300 font-mono font-bold tracking-wider">RehabVR</span>
+          </div>
+          <p class="text-[11px] text-slate-500 dark:text-slate-400 tracking-tight flex items-center gap-2 font-medium">
+            <span class="text-cyan-600 dark:text-cyan-400 font-mono font-semibold">Tracked Arc Kinematics</span>
+            <span>•</span>
+            <span>Upper-Limb Telemetry Hub</span>
+          </p>
+        </div>
+      </div>
+
+      <!-- Live VR Controller Ingestion Link Status -->
+      <div class="hidden md:flex items-center space-x-6">
+        <div class="flex items-center space-x-3 px-3.5 py-1.5 rounded-full bg-white/80 dark:bg-slate-900/90 border border-slate-200 dark:border-slate-700 shadow-sm">
+          <span class="relative flex h-2.5 w-2.5">
+            <span id="espPing" class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-75"></span>
+            <span id="espDot" class="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+          </span>
+          <div class="text-[11px] font-mono leading-tight">
+            <span class="text-slate-500 dark:text-slate-400">VR Controller Link:</span>
+            <span id="espStatusLabel" class="text-emerald-600 dark:text-emerald-400 font-bold ml-1">LIVE INGESTION (5Hz)</span>
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-2 text-xs font-mono text-slate-600 dark:text-slate-300">
+          <i class="fa-solid fa-satellite-dish text-cyan-600 dark:text-cyan-400"></i>
+          <span>sahaaya-vr.web.app</span>
+        </div>
+      </div>
+
+      <div class="flex items-center space-x-2 sm:space-x-3">
+        <div class="p-1 bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl flex items-center text-xs font-semibold shadow-inner">
+          <button id="navBtnLanding" onclick="switchView('landing')" class="px-3.5 py-1.5 rounded-lg transition-all text-slate-900 dark:text-white bg-white dark:bg-slate-800 shadow-sm font-bold">
+            <i class="fa-solid fa-cubes mr-1.5 text-cyan-500"></i> Hub
+          </button>
+          <button id="navBtnDoctor" onclick="switchView('doctor')" class="px-3.5 py-1.5 rounded-lg transition-all text-slate-600 dark:text-slate-400 hover:text-cyan-600">
+            <i class="fa-solid fa-user-doctor mr-1.5 text-cyan-500"></i> Doctor
+          </button>
+          <button id="navBtnPatient" onclick="switchView('patient')" class="px-3.5 py-1.5 rounded-lg transition-all text-slate-600 dark:text-slate-400 hover:text-violet-600">
+            <i class="fa-solid fa-gamepad mr-1.5 text-violet-500"></i> Patient VR
+          </button>
+        </div>
+
+        <button id="themeToggleBtn" onclick="toggleTheme()" class="w-9 h-9 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:border-cyan-500 flex items-center justify-center text-slate-700 dark:text-amber-400 transition shadow-sm" title="Toggle Light / Dark Mode">
+          <i id="themeIcon" class="fa-solid fa-sun text-sm"></i>
+        </button>
+
+        <button id="soundToggleBtn" onclick="toggleAudio()" class="w-9 h-9 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:border-cyan-500 flex items-center justify-center text-cyan-600 dark:text-cyan-400 transition shadow-sm" title="Toggle Synthesized Audio Chimes">
+          <i id="soundIcon" class="fa-solid fa-volume-high text-sm"></i>
+        </button>
+      </div>
+
+    </div>
+  </header>
+
+  <main id="view-landing" class="view-fade view-visible flex-grow relative z-10">
+    <div id="heroContainer" class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 lg:py-16 flying-hero-enter">
+      
+      <div class="flex justify-center mb-6">
+        <div class="inline-flex items-center space-x-3 px-4 py-2 rounded-full glass-base border-cyan-400/50 text-cyan-800 dark:text-cyan-300 text-xs shadow-md">
+          <span class="w-2 h-2 rounded-full bg-cyan-500 animate-ping"></span>
+          <i class="fa-solid fa-ribbon text-cyan-600 dark:text-cyan-400"></i>
+          <span>Clinical Protocol Mentored by <strong>Dr. Venkata Ramana</strong> (AIIMS Bhubaneswar)</span>
+          <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-950 border border-emerald-500/50 text-emerald-700 dark:text-emerald-300 font-mono font-bold">VERIFIED</span>
+        </div>
+      </div>
+
+      <div class="text-center max-w-4xl mx-auto mb-12 relative">
+        <div class="cinematic-ring w-96 h-96 -top-12 left-1/2 -translate-x-1/2 opacity-30"></div>
+
+        <h1 class="text-4xl sm:text-6xl lg:text-7xl font-black tracking-tight leading-tight mb-5">
+          <span class="block text-slate-900 dark:text-white drop-shadow-sm">REHABILITATION</span>
+          <span class="bg-clip-text text-transparent bg-gradient-to-r from-cyan-600 via-blue-600 to-violet-600 font-extrabold">RE-ENGINEERED IN VR</span>
+        </h1>
+        <p class="text-slate-600 dark:text-slate-300 text-base sm:text-lg max-w-2xl mx-auto font-normal leading-relaxed">
+          Intelligent Upper-Limb Rehabilitation for Cerebral Palsy & Stroke Recovery. Powered by VR Controller Ingestion, Kinematic Arc Telemetry, Directional Swing Classification & Real-Time Clinical Biofeedback.
+        </p>
+
+        <div class="mt-8 flex flex-wrap justify-center items-center gap-2.5 font-mono text-xs text-slate-700 dark:text-slate-300">
+          <span class="px-3.5 py-1.5 rounded-xl glass-base border-slate-300 dark:border-slate-700 flex items-center gap-2 shadow-sm"><i class="fa-solid fa-arrows-to-circle text-cyan-500"></i> Tracked Movement Arc</span>
+          <span class="px-3.5 py-1.5 rounded-xl glass-base border-slate-300 dark:border-slate-700 flex items-center gap-2 shadow-sm"><i class="fa-solid fa-gauge-high text-violet-500"></i> Hand Movement Speed</span>
+          <span class="px-3.5 py-1.5 rounded-xl glass-base border-slate-300 dark:border-slate-700 flex items-center gap-2 shadow-sm"><i class="fa-solid fa-bullseye text-emerald-500"></i> Hit Accuracy & Streaks</span>
+          <span class="px-3.5 py-1.5 rounded-xl glass-base border-slate-300 dark:border-slate-700 flex items-center gap-2 shadow-sm"><i class="fa-solid fa-shuffle text-blue-500"></i> Forehand / Backhand Classification</span>
+          <span class="px-3.5 py-1.5 rounded-xl glass-base border-slate-300 dark:border-slate-700 flex items-center gap-2 shadow-sm"><i class="fa-solid fa-bolt text-amber-500"></i> Real-Time Telemetry Stream</span>
+        </div>
+      </div>
+
+      <div class="portal-perspective grid grid-cols-1 md:grid-cols-2 gap-8 max-w-5xl mx-auto my-8">
+        
+        <!-- Portal 1: Doctor / Therapist -->
+        <div id="cardDoctorPortal" onclick="switchView('doctor')" class="tilt-card flying-card-doc group cursor-pointer relative rounded-3xl p-8 sm:p-9 glass-card-portal-doc overflow-hidden flex flex-col justify-between">
+          <div class="absolute -right-20 -top-20 w-72 h-72 rounded-full bg-cyan-400/20 blur-3xl group-hover:bg-cyan-400/35 transition-all duration-500"></div>
+          
+          <div class="relative z-10 pointer-events-none">
+            <div class="flex items-center justify-between mb-6">
+              <span class="px-3.5 py-1 rounded-full text-xs font-mono font-bold bg-cyan-100 dark:bg-cyan-950 text-cyan-800 dark:text-cyan-300 border border-cyan-400/60 flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-cyan-500 animate-pulse"></span>
+                <i class="fa-solid fa-stethoscope"></i> CLINICAL CONSOLE
+              </span>
+              <div class="w-12 h-12 rounded-2xl bg-cyan-500/15 border border-cyan-500/40 flex items-center justify-center text-cyan-600 dark:text-cyan-400 group-hover:scale-110 group-hover:bg-cyan-500 group-hover:text-white transition-all duration-300 shadow-lg shadow-cyan-500/20">
+                <i class="fa-solid fa-user-doctor text-2xl"></i>
+              </div>
+            </div>
+
+            <h2 class="text-2xl sm:text-3xl font-black text-slate-900 dark:text-white mb-3 group-hover:text-cyan-600 dark:group-hover:text-cyan-300 transition-colors">
+              DOCTOR / THERAPIST PORTAL
+            </h2>
+            <p class="text-slate-600 dark:text-slate-300 text-sm leading-relaxed mb-6 font-normal">
+              Inspect comprehensive live telemetry: Tracked Movement Arc, Hand Movement Speed, Angular Velocity, Movement Smoothness, Hit Accuracy (92%), Swings Completed, Forehand/Backhand distribution, and session history.
+            </p>
+
+            <div class="grid grid-cols-2 gap-2.5 text-xs font-mono text-slate-700 dark:text-slate-300 mb-6">
+              <div class="flex items-center space-x-2 bg-white/70 dark:bg-slate-950/70 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm">
+                <i class="fa-solid fa-chart-line text-cyan-600 dark:text-cyan-400"></i>
+                <span>Kinematic Waveforms</span>
+              </div>
+              <div class="flex items-center space-x-2 bg-white/70 dark:bg-slate-950/70 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm">
+                <i class="fa-solid fa-bullseye text-cyan-600 dark:text-cyan-400"></i>
+                <span>Accuracy & Streak KPIs</span>
+              </div>
+              <div class="flex items-center space-x-2 bg-white/70 dark:bg-slate-950/70 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm">
+                <i class="fa-solid fa-arrows-split-up-and-left text-cyan-600 dark:text-cyan-400"></i>
+                <span>Forehand / Backhand</span>
+              </div>
+              <div class="flex items-center space-x-2 bg-white/70 dark:bg-slate-950/70 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm">
+                <i class="fa-solid fa-file-export text-cyan-600 dark:text-cyan-400"></i>
+                <span>CSV Telemetry Export</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="relative z-10 pt-5 border-t border-slate-200 dark:border-slate-700/60 flex items-center justify-between text-cyan-600 dark:text-cyan-300 font-semibold group-hover:translate-x-1 transition-transform">
+            <span class="text-sm flex items-center font-bold">
+              Launch Clinical Analytics
+              <i class="fa-solid fa-arrow-right ml-2 group-hover:ml-3 transition-all"></i>
+            </span>
+            <span class="text-[11px] font-mono px-2.5 py-1 rounded-lg bg-cyan-100 dark:bg-cyan-950 text-cyan-800 dark:text-cyan-300 border border-cyan-300 dark:border-cyan-700 font-bold">Live Stream Ready</span>
+          </div>
+        </div>
+
+        <!-- Portal 2: Patient VR Simulator -->
+        <div id="cardPatientPortal" onclick="switchView('patient')" class="tilt-card flying-card-pat group cursor-pointer relative rounded-3xl p-8 sm:p-9 glass-card-portal-pat overflow-hidden flex flex-col justify-between">
+          <div class="absolute -right-20 -top-20 w-72 h-72 rounded-full bg-violet-400/20 blur-3xl group-hover:bg-violet-400/35 transition-all duration-500"></div>
+          
+          <div class="relative z-10 pointer-events-none">
+            <div class="flex items-center justify-between mb-6">
+              <span class="px-3.5 py-1 rounded-full text-xs font-mono font-bold bg-violet-100 dark:bg-violet-950 text-violet-800 dark:text-violet-300 border border-violet-400/60 flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-violet-500 animate-pulse"></span>
+                <i class="fa-solid fa-vr-cardboard"></i> REHAB VR ENGINE
+              </span>
+              <div class="w-12 h-12 rounded-2xl bg-violet-500/15 border border-violet-500/40 flex items-center justify-center text-violet-600 dark:text-violet-400 group-hover:scale-110 group-hover:bg-violet-500 group-hover:text-white transition-all duration-300 shadow-lg shadow-violet-500/20">
+                <i class="fa-solid fa-gamepad text-2xl"></i>
+              </div>
+            </div>
+
+            <h2 class="text-2xl sm:text-3xl font-black text-slate-900 dark:text-white mb-3 group-hover:text-violet-600 dark:group-hover:text-violet-300 transition-colors">
+              PATIENT REHAB VR PORTAL
+            </h2>
+            <p class="text-slate-600 dark:text-slate-300 text-sm leading-relaxed mb-6 font-normal">
+              Play five responsive rehabilitation modules (Table Tennis, Shield Defender, River Kayak, Laser Harp, Fruit Catcher). Real-time swing tracking, hit accuracy feedback, consecutive streak milestones, and session pause/stop controls.
+            </p>
+
+            <div class="grid grid-cols-2 gap-2.5 text-xs font-mono text-slate-700 dark:text-slate-300 mb-6">
+              <div class="flex items-center space-x-2 bg-white/70 dark:bg-slate-950/70 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm">
+                <i class="fa-solid fa-gamepad text-violet-600 dark:text-violet-400"></i>
+                <span>5 Rehabilitation Games</span>
+              </div>
+              <div class="flex items-center space-x-2 bg-white/70 dark:bg-slate-950/70 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm">
+                <i class="fa-solid fa-fire text-violet-600 dark:text-violet-400"></i>
+                <span>Hits & Streak Multiplier</span>
+              </div>
+              <div class="flex items-center space-x-2 bg-white/70 dark:bg-slate-950/70 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm">
+                <i class="fa-solid fa-pause text-violet-600 dark:text-violet-400"></i>
+                <span>Pause & Stop Controls</span>
+              </div>
+              <div class="flex items-center space-x-2 bg-white/70 dark:bg-slate-950/70 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm">
+                <i class="fa-solid fa-rotate text-violet-600 dark:text-violet-400"></i>
+                <span>Live Swings Counter</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="relative z-10 pt-5 border-t border-slate-200 dark:border-slate-700/60 flex items-center justify-between text-violet-600 dark:text-violet-300 font-semibold group-hover:translate-x-1 transition-transform">
+            <span class="text-sm flex items-center font-bold">
+              Launch VR Therapy Session
+              <i class="fa-solid fa-arrow-right ml-2 group-hover:ml-3 transition-all"></i>
+            </span>
+            <span class="text-[11px] font-mono px-2.5 py-1 rounded-lg bg-violet-100 dark:bg-violet-950 text-violet-800 dark:text-violet-300 border border-violet-300 dark:border-violet-700 font-bold">Play Now</span>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+  </main>
+
+  <section id="view-doctor" class="view-fade view-hidden flex-grow relative z-10 px-4 sm:px-6 lg:px-8 py-6">
+    <div class="max-w-7xl mx-auto space-y-6">
+      
+      <!-- Patient & Session Metadata Banner -->
+      <div class="glass-base p-5 rounded-3xl flex flex-wrap items-center justify-between gap-4 border border-cyan-400/40 shadow-lg">
+        <div class="flex items-center space-x-4">
+          <div class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center text-white font-black shadow-lg shadow-cyan-500/25">
+            <i class="fa-solid fa-user-doctor text-2xl"></i>
+          </div>
+          <div>
+            <div class="flex items-center space-x-3 flex-wrap gap-y-2">
+              <h2 class="text-xl sm:text-2xl font-black text-slate-900 dark:text-white">Therapist Telemetry Analytics</h2>
+              
+              <!-- Session Dropdown Selector -->
+              <div class="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full bg-emerald-100 dark:bg-emerald-950/80 border border-emerald-500/50 shadow-sm text-xs font-mono font-bold text-emerald-800 dark:text-emerald-300">
+                <span class="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
+                <span>Session:</span>
+                <select id="docSessionSelect" onchange="window.handleSessionDropdownChange(this.value)" class="bg-transparent text-emerald-900 dark:text-emerald-200 font-bold focus:outline-none cursor-pointer pr-1">
+                  <option value="live_session" class="bg-white dark:bg-slate-900 text-slate-900 dark:text-white">live_session (Active Live)</option>
+                  <option value="TEST_SESSION_01" class="bg-white dark:bg-slate-900 text-slate-900 dark:text-white">TEST_SESSION_01 (Quest Sync)</option>
+                  <option value="SESS-12" class="bg-white dark:bg-slate-900 text-slate-900 dark:text-white">SESS-12 (Clinical Baseline)</option>
+                </select>
+              </div>
+
+              <span class="px-2.5 py-0.5 rounded-full bg-cyan-100 dark:bg-cyan-950 text-cyan-800 dark:text-cyan-300 border border-cyan-500/40 text-xs font-mono font-semibold">
+                Mode: <strong id="docBadgeMode">AI Opponent</strong>
+              </span>
+              <span class="px-2.5 py-0.5 rounded-full bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 border border-amber-500/40 text-xs font-mono font-semibold">
+                Difficulty: <strong id="docBadgeDiff">Medium</strong>
+              </span>
+            </div>
+            <p class="text-xs text-slate-500 dark:text-slate-400 font-medium mt-1">
+              Patient: <strong class="text-slate-900 dark:text-white font-mono" id="docBadgePatient">PAT-2026-081 (John Doe, Age: 14)</strong> • Diagnosis: <span class="text-cyan-600 dark:text-cyan-300 font-semibold">Spastic Hemiplegic CP</span> • Duration: <span class="font-mono text-slate-700 dark:text-slate-300 font-bold" id="docSessionTimer">14m 32s</span>
+            </p>
+          </div>
+        </div>
+
+        <div class="flex items-center flex-wrap gap-2.5">
+          <button id="toggleStreamBtn" onclick="toggleTelemetryStream()" class="px-4 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-black text-xs flex items-center space-x-2 transition shadow-md shadow-cyan-500/25">
+            <i class="fa-solid fa-pause" id="streamBtnIcon"></i>
+            <span id="streamBtnText">Stream Active</span>
+          </button>
+
+          <button onclick="triggerHapticPulse('doctor_request')" class="px-4 py-2.5 rounded-xl bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-cyan-700 dark:text-cyan-300 border border-cyan-400/60 font-bold text-xs flex items-center space-x-2 transition shadow-sm">
+            <i class="fa-solid fa-wave-square text-cyan-500"></i>
+            <span>Send Haptic Ping</span>
+          </button>
+
+          <button onclick="exportTelemetryCSV()" class="px-4 py-2.5 rounded-xl bg-slate-900 dark:bg-slate-800 hover:bg-slate-800 text-white font-bold text-xs flex items-center space-x-2 transition shadow-sm" title="Download real session data CSV">
+            <i class="fa-solid fa-download text-emerald-400"></i>
+            <span>Export CSV</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+        
+        <!-- Metric 1: Tracked Movement Arc -->
+        <div class="glass-base p-4 rounded-2xl relative overflow-hidden border border-slate-200 dark:border-slate-800 hover:border-cyan-500 transition shadow-sm">
+          <div class="flex items-center justify-between text-slate-500 dark:text-slate-400 text-xs font-semibold mb-1.5">
+            <span>Tracked Movement Arc</span>
+            <i class="fa-solid fa-arrows-to-circle text-cyan-500"></i>
+          </div>
+          <div class="text-3xl font-black text-cyan-600 dark:text-cyan-400 font-mono tracking-tight" id="docMetricArc">90.0°</div>
+          <div class="text-[11px] text-slate-500 dark:text-slate-400 mt-1 flex items-center justify-between">
+            <span>Target: 60°–120°</span>
+            <span class="text-emerald-600 dark:text-emerald-400 font-bold" id="docArcStatus">Neutral (90°)</span>
+          </div>
+          <div class="w-full bg-slate-100 dark:bg-slate-950 h-2 rounded-full mt-3 overflow-hidden border border-slate-200 dark:border-slate-800">
+            <div id="docBarArc" class="bg-gradient-to-r from-cyan-500 to-blue-500 h-full transition-all duration-150" style="width: 50%"></div>
+          </div>
+        </div>
+
+        <!-- Metric 2: Hand Movement Speed (m/s) -->
+        <div class="glass-base p-4 rounded-2xl relative overflow-hidden border border-slate-200 dark:border-slate-800 hover:border-blue-500 transition shadow-sm">
+          <div class="flex items-center justify-between text-slate-500 dark:text-slate-400 text-xs font-semibold mb-1.5">
+            <span>Movement Speed</span>
+            <i class="fa-solid fa-gauge text-blue-500"></i>
+          </div>
+          <div class="text-3xl font-black text-blue-600 dark:text-blue-400 font-mono tracking-tight" id="docMetricSpeed">0.45 <span class="text-sm font-normal text-slate-500">m/s</span></div>
+          <div class="text-[11px] text-slate-500 dark:text-slate-400 mt-1 flex items-center justify-between">
+            <span>Hand / Bat Pace</span>
+            <span class="text-cyan-600 dark:text-cyan-300 font-semibold" id="docSpeedPace">Fluid Sweep</span>
+          </div>
+          <div class="w-full bg-slate-100 dark:bg-slate-950 h-2 rounded-full mt-3 overflow-hidden border border-slate-200 dark:border-slate-800">
+            <div id="docBarSpeed" class="bg-gradient-to-r from-blue-500 to-indigo-500 h-full transition-all duration-150" style="width: 45%"></div>
+          </div>
+        </div>
+
+        <!-- Metric 3: Angular Speed (°/s) -->
+        <div class="glass-base p-4 rounded-2xl relative overflow-hidden border border-slate-200 dark:border-slate-800 hover:border-violet-500 transition shadow-sm">
+          <div class="flex items-center justify-between text-slate-500 dark:text-slate-400 text-xs font-semibold mb-1.5">
+            <span>Angular Speed</span>
+            <i class="fa-solid fa-rotate text-violet-500"></i>
+          </div>
+          <div class="text-3xl font-black text-violet-600 dark:text-violet-400 font-mono tracking-tight" id="docMetricAngularSpeed">35.2 <span class="text-sm font-normal text-slate-500">°/s</span></div>
+          <div class="text-[11px] text-slate-500 dark:text-slate-400 mt-1 flex items-center justify-between">
+            <span>Rotation Rate</span>
+            <span class="text-emerald-600 dark:text-emerald-400 font-bold" id="docAngularSpeedState">Optimal</span>
+          </div>
+          <div class="w-full bg-slate-100 dark:bg-slate-950 h-2 rounded-full mt-3 overflow-hidden border border-slate-200 dark:border-slate-800">
+            <div id="docBarAngularSpeed" class="bg-gradient-to-r from-violet-500 to-purple-500 h-full transition-all duration-150" style="width: 40%"></div>
+          </div>
+        </div>
+
+        <!-- Metric 4: Movement Smoothness -->
+        <div class="glass-base p-4 rounded-2xl relative overflow-hidden border border-slate-200 dark:border-slate-800 hover:border-emerald-500 transition shadow-sm">
+          <div class="flex items-center justify-between text-slate-500 dark:text-slate-400 text-xs font-semibold mb-1.5">
+            <span>Smoothness</span>
+            <i class="fa-solid fa-wave-square text-emerald-500"></i>
+          </div>
+          <div class="text-3xl font-black text-emerald-600 dark:text-emerald-400 font-mono tracking-tight" id="docMetricSmoothness">0.89</div>
+          <div class="text-[11px] text-slate-500 dark:text-slate-400 mt-1 flex items-center justify-between">
+            <span>Tremor Index</span>
+            <span class="text-emerald-600 dark:text-emerald-400 font-bold" id="docSmoothnessState">Consistent (89%)</span>
+          </div>
+          <div class="w-full bg-slate-100 dark:bg-slate-950 h-2 rounded-full mt-3 overflow-hidden border border-slate-200 dark:border-slate-800">
+            <div id="docBarSmoothness" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-full transition-all duration-150" style="width: 89%"></div>
+          </div>
+        </div>
+
+        <!-- Metric 5: Total Swings (Completed / Target) -->
+        <div class="glass-base p-4 rounded-2xl relative overflow-hidden border border-slate-200 dark:border-slate-800 hover:border-rose-500 transition shadow-sm">
+          <div class="flex items-center justify-between text-slate-500 dark:text-slate-400 text-xs font-semibold mb-1.5">
+            <span>Total Swings</span>
+            <i class="fa-solid fa-person-walking-arrow-right text-rose-500"></i>
+          </div>
+          <div class="text-3xl font-black text-rose-600 dark:text-rose-400 font-mono tracking-tight" id="docMetricSwings">24</div>
+          <div class="text-[11px] text-slate-500 dark:text-slate-400 mt-1 flex items-center justify-between">
+            <span>Session Quota</span>
+            <span class="text-rose-600 dark:text-rose-400 font-bold" id="docSwingsPct">80%</span>
+          </div>
+          <div class="w-full bg-slate-100 dark:bg-slate-950 h-2 rounded-full mt-3 overflow-hidden border border-slate-200 dark:border-slate-800">
+            <div id="docBarSwings" class="bg-gradient-to-r from-rose-500 to-pink-500 h-full transition-all duration-300" style="width: 80%"></div>
+          </div>
+        </div>
+
+        <!-- Metric 6: Hit Accuracy (%) -->
+        <div class="glass-base p-4 rounded-2xl relative overflow-hidden border border-slate-200 dark:border-slate-800 hover:border-amber-500 transition shadow-sm">
+          <div class="flex items-center justify-between text-slate-500 dark:text-slate-400 text-xs font-semibold mb-1.5">
+            <span>Hit Accuracy</span>
+            <i class="fa-solid fa-bullseye text-amber-500"></i>
+          </div>
+          <div class="text-3xl font-black text-amber-600 dark:text-amber-400 font-mono tracking-tight" id="docMetricAccuracy">92.4%</div>
+          <div class="text-[11px] text-slate-500 dark:text-slate-400 mt-1 flex items-center justify-between">
+            <span>Contact Ratio</span>
+            <span class="text-emerald-600 dark:text-emerald-400 font-bold">24 Hits / 2 Misses</span>
+          </div>
+          <div class="w-full bg-slate-100 dark:bg-slate-950 h-2 rounded-full mt-3 overflow-hidden border border-slate-200 dark:border-slate-800">
+            <div id="docBarAccuracy" class="bg-gradient-to-r from-amber-500 to-yellow-500 h-full transition-all duration-150" style="width: 92.4%"></div>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+        
+        <!-- KPI: Successful Hits -->
+        <div class="glass-base p-3.5 rounded-2xl border border-slate-200 dark:border-slate-800 flex items-center space-x-3 shadow-sm">
+          <div class="w-10 h-10 rounded-xl bg-emerald-100 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400 flex items-center justify-center text-lg">
+            <i class="fa-solid fa-check"></i>
+          </div>
+          <div>
+            <div class="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Successful Hits</div>
+            <div class="text-xl font-extrabold text-slate-900 dark:text-white font-mono" id="docValHits">24</div>
+          </div>
+        </div>
+
+        <!-- KPI: Missed Balls -->
+        <div class="glass-base p-3.5 rounded-2xl border border-slate-200 dark:border-slate-800 flex items-center space-x-3 shadow-sm">
+          <div class="w-10 h-10 rounded-xl bg-rose-100 dark:bg-rose-950 text-rose-600 dark:text-rose-400 flex items-center justify-center text-lg">
+            <i class="fa-solid fa-xmark"></i>
+          </div>
+          <div>
+            <div class="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Missed Balls</div>
+            <div class="text-xl font-extrabold text-slate-900 dark:text-white font-mono" id="docValMisses">2</div>
+          </div>
+        </div>
+
+        <!-- KPI: Current Streak -->
+        <div class="glass-base p-3.5 rounded-2xl border border-slate-200 dark:border-slate-800 flex items-center space-x-3 shadow-sm">
+          <div class="w-10 h-10 rounded-xl bg-amber-100 dark:bg-amber-950 text-amber-600 dark:text-amber-400 flex items-center justify-center text-lg">
+            <i class="fa-solid fa-fire"></i>
+          </div>
+          <div>
+            <div class="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Current Streak</div>
+            <div class="text-xl font-extrabold text-amber-500 font-mono" id="docValCurrentStreak">12 🔥</div>
+          </div>
+        </div>
+
+        <!-- KPI: Best Streak -->
+        <div class="glass-base p-3.5 rounded-2xl border border-slate-200 dark:border-slate-800 flex items-center space-x-3 shadow-sm">
+          <div class="w-10 h-10 rounded-xl bg-violet-100 dark:bg-violet-950 text-violet-600 dark:text-violet-400 flex items-center justify-center text-lg">
+            <i class="fa-solid fa-trophy"></i>
+          </div>
+          <div>
+            <div class="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Best Streak</div>
+            <div class="text-xl font-extrabold text-violet-600 dark:text-violet-400 font-mono" id="docValBestStreak">16</div>
+          </div>
+        </div>
+
+        <!-- KPI: Forehand vs Backhand Distribution -->
+        <div class="glass-base p-3.5 rounded-2xl border border-slate-200 dark:border-slate-800 flex flex-col justify-between shadow-sm">
+          <div class="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400 font-medium mb-1">
+            <span>Forehand / Backhand</span>
+            <i class="fa-solid fa-table-tennis-paddle-ball text-cyan-500"></i>
+          </div>
+          <div class="flex items-center justify-between font-mono text-sm font-bold text-slate-900 dark:text-white">
+            <span class="text-cyan-600 dark:text-cyan-400" id="docValForehand">FH: 14</span>
+            <span class="text-violet-600 dark:text-violet-400" id="docValBackhand">BH: 10</span>
+          </div>
+          <div class="w-full bg-slate-100 dark:bg-slate-950 h-1.5 rounded-full mt-1.5 overflow-hidden flex border border-slate-200 dark:border-slate-800">
+            <div id="docBarForehand" class="bg-cyan-500 h-full" style="width: 58%"></div>
+            <div id="docBarBackhand" class="bg-violet-500 h-full" style="width: 42%"></div>
+          </div>
+        </div>
+
+        <!-- KPI: Reaction Time (ms) -->
+        <div class="glass-base p-3.5 rounded-2xl border border-slate-200 dark:border-slate-800 flex items-center space-x-3 shadow-sm">
+          <div class="w-10 h-10 rounded-xl bg-cyan-100 dark:bg-cyan-950 text-cyan-600 dark:text-cyan-400 flex items-center justify-center text-lg">
+            <i class="fa-solid fa-stopwatch"></i>
+          </div>
+          <div>
+            <div class="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Avg Reaction Time</div>
+            <div class="text-xl font-extrabold text-cyan-600 dark:text-cyan-400 font-mono" id="docValReactionTime">340 <span class="text-xs font-normal text-slate-500">ms</span></div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Live Patient Controller Arc Position Tracker (Doctor View) -->
+      <div class="glass-base p-4 sm:p-5 rounded-3xl border border-cyan-400/50 shadow-md">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
+          <div class="flex items-center space-x-3">
+            <div class="w-10 h-10 rounded-2xl bg-cyan-100 dark:bg-cyan-950 text-cyan-600 dark:text-cyan-400 flex items-center justify-center text-lg font-bold shadow-sm">
+              <i class="fa-solid fa-arrows-left-right"></i>
+            </div>
+            <div>
+              <div class="flex items-center space-x-2">
+                <h3 class="text-sm font-extrabold text-slate-900 dark:text-white">Patient Controller Live Position</h3>
+                <span id="docLiveArcBadge" class="text-xs font-mono font-black px-2 py-0.5 rounded-md bg-cyan-100 dark:bg-cyan-950 text-cyan-700 dark:text-cyan-300 border border-cyan-400/60">90.0°</span>
+                <span id="docLiveZoneLabel" class="text-xs font-bold text-emerald-600 dark:text-emerald-400 font-mono">Neutral (Center)</span>
+              </div>
+              <p class="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Real-time horizontal arc position streamed directly from the Quest controller</p>
+            </div>
+          </div>
+          <div class="flex items-center space-x-2 text-xs font-mono">
+            <span class="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
+            <span class="text-slate-500 dark:text-slate-400">Range:</span>
+            <span class="font-bold text-slate-900 dark:text-white">55° to 125°</span>
+          </div>
+        </div>
+
+        <div class="relative w-full px-2 pt-2 pb-1">
+          <!-- Background track with 3 zone markers -->
+          <div class="relative w-full h-4 bg-slate-200 dark:bg-slate-800 rounded-full overflow-visible border border-slate-300 dark:border-slate-700">
+            <!-- Active Fill Bar -->
+            <div id="docLiveArcBar" class="h-full rounded-full bg-gradient-to-r from-violet-500 via-cyan-500 to-blue-500 transition-all duration-100" style="width: 50%"></div>
+            
+            <!-- Position Indicator Pin -->
+            <div id="docLiveArcPin" class="absolute top-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-white border-4 border-cyan-500 shadow-lg transition-all duration-100 pointer-events-none" style="left: calc(50% - 10px);"></div>
+
+            <!-- Center neutral tick -->
+            <div class="absolute top-0 bottom-0 left-1/2 w-0.5 bg-slate-400 dark:bg-slate-600 -translate-x-1/2 pointer-events-none"></div>
+          </div>
+
+          <!-- Axis Labels -->
+          <div class="flex justify-between text-[11px] font-mono text-slate-500 dark:text-slate-400 mt-2 font-medium">
+            <span class="flex items-center gap-1 text-violet-600 dark:text-violet-400 font-bold"><i class="fa-solid fa-arrow-left"></i> Left Adduction (55°)</span>
+            <span class="text-emerald-600 dark:text-emerald-400 font-bold">● Neutral (90°)</span>
+            <span class="flex items-center gap-1 text-cyan-600 dark:text-cyan-400 font-bold">Right Abduction (125°) <i class="fa-solid fa-arrow-right"></i></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        
+        <!-- Live Kinematic Oscilloscope Canvas -->
+        <div class="lg:col-span-2 glass-base p-5 rounded-3xl border border-slate-200 dark:border-slate-800 flex flex-col justify-between shadow-lg">
+          <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+            <div>
+              <h3 class="text-base font-extrabold text-slate-900 dark:text-white flex items-center gap-2">
+                <i class="fa-solid fa-chart-line text-cyan-500"></i>
+                Multi-Channel Kinematic & Motion Oscilloscope
+              </h3>
+              <p class="text-xs text-slate-500 dark:text-slate-400">Continuous 100Hz real-time stream: Tracked Movement Arc (Cyan), Movement Speed (Blue), Angular Speed (Violet)</p>
+            </div>
+            <div class="flex items-center space-x-3 font-mono text-xs">
+              <span class="flex items-center gap-1.5 text-cyan-600 dark:text-cyan-400 font-semibold"><span class="w-2.5 h-2.5 rounded-full bg-cyan-500 inline-block shadow-sm"></span> Tracked Arc (55°-125°)</span>
+              <span class="flex items-center gap-1.5 text-blue-600 dark:text-blue-400 font-semibold"><span class="w-2.5 h-2.5 rounded-full bg-blue-600 inline-block shadow-sm"></span> Speed (m/s x50)</span>
+              <span class="flex items-center gap-1.5 text-violet-600 dark:text-violet-400 font-semibold"><span class="w-2.5 h-2.5 rounded-full bg-violet-600 inline-block shadow-sm"></span> Ang Speed (°/s)</span>
+            </div>
+          </div>
+
+          <div class="relative w-full h-64 bg-slate-900 rounded-2xl border border-slate-800 p-2 overflow-hidden shadow-inner">
+            <canvas id="telemetryCanvas" class="w-full h-full block"></canvas>
+            <div class="absolute top-3 left-4 pointer-events-none text-[11px] font-mono text-slate-400 font-semibold flex items-center gap-2">
+              <span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>
+              <span>100Hz VR CONTROLLER KINEMATIC STREAM</span>
+            </div>
+            <div class="absolute bottom-2 right-4 pointer-events-none text-[11px] font-mono text-emerald-400 font-bold">
+              ● MOTION CALIBRATION: ACTIVE (90° NEUTRAL)
+            </div>
+          </div>
+
+          <div class="mt-4 pt-3 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between text-xs text-slate-600 dark:text-slate-400 gap-3">
+            <div>
+              Target Range: <span class="font-mono text-slate-900 dark:text-white font-bold">60° to 120°</span>
+            </div>
+            <div>
+              Smoothness Index: <span id="docSmoothnessIndex" class="font-mono text-cyan-600 dark:text-cyan-400 font-bold">0.89 (Optimal Form)</span>
+            </div>
+            <div>
+              Spasticity Fatigue: <span id="docFatigueIndex" class="font-mono text-emerald-600 dark:text-emerald-400 font-bold">Low (16%)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Haptic Resistance & Directive Panel -->
+        <div class="glass-base p-5 rounded-3xl border border-slate-200 dark:border-slate-800 flex flex-col justify-between shadow-lg">
+          <div>
+            <div class="flex items-center justify-between mb-4">
+              <h3 class="text-base font-extrabold text-slate-900 dark:text-white flex items-center gap-2">
+                <i class="fa-solid fa-sliders text-cyan-500"></i>
+                Haptic Feedback Loop
+              </h3>
+              <span class="text-[11px] font-mono px-2.5 py-0.5 rounded-md bg-cyan-100 dark:bg-cyan-950 text-cyan-800 dark:text-cyan-300 border border-cyan-400 font-bold">Remote PWM</span>
+            </div>
+            <p class="text-xs text-slate-600 dark:text-slate-300 mb-5 leading-relaxed font-normal">
+              Adjustments dispatch in real-time to the patient's reverse-U carriage motor and handle vibration sensor.
+            </p>
+
+            <div class="space-y-4">
+              <div>
+                <div class="flex justify-between text-xs mb-1.5">
+                  <span class="text-slate-700 dark:text-slate-300 font-semibold">Bilateral Resistance Level</span>
+                  <span id="labelResistance" class="font-mono text-cyan-600 dark:text-cyan-400 font-extrabold">4.5 kg</span>
+                </div>
+                <input id="sliderResistance" type="range" min="1" max="10" step="0.5" value="4.5" oninput="updateResistance(this.value)" class="w-full h-2 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-500 border border-slate-300 dark:border-slate-700">
+                <div class="flex justify-between text-[10px] font-mono text-slate-500 dark:text-slate-400 mt-1">
+                  <span>1.0 kg (Gentle)</span>
+                  <span>5.0 kg (Standard)</span>
+                  <span>10.0 kg (Intense)</span>
+                </div>
+              </div>
+
+              <div>
+                <div class="flex justify-between text-xs mb-1.5">
+                  <span class="text-slate-700 dark:text-slate-300 font-semibold">Haptic Buzz Alert Strength</span>
+                  <span id="labelVibration" class="font-mono text-violet-600 dark:text-violet-400 font-extrabold">75 %</span>
+                </div>
+                <input id="sliderVibration" type="range" min="0" max="100" step="5" value="75" oninput="updateVibration(this.value)" class="w-full h-2 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-pointer accent-violet-600 border border-slate-300 dark:border-slate-700">
+                <div class="flex justify-between text-[10px] font-mono text-slate-500 dark:text-slate-400 mt-1">
+                  <span>Mute</span>
+                  <span>50%</span>
+                  <span>100% (High Tactile)</span>
+                </div>
+              </div>
+
+              <div>
+                <label class="text-xs text-slate-700 dark:text-slate-300 font-semibold block mb-1.5">Exercise Speed / Ball Pace</label>
+                <div class="grid grid-cols-3 gap-2">
+                  <button onclick="setGamePace('gentle')" id="btnPaceGentle" class="py-2 text-xs font-bold rounded-xl bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 transition">Slow</button>
+                  <button onclick="setGamePace('normal')" id="btnPaceNormal" class="py-2 text-xs font-bold rounded-xl bg-cyan-600 text-white border border-cyan-600 transition shadow-sm">Standard</button>
+                  <button onclick="setGamePace('brisk')" id="btnPaceBrisk" class="py-2 text-xs font-bold rounded-xl bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 transition">Brisk</button>
+                </div>
+              </div>
+
+              <div class="pt-2">
+                <label class="text-xs text-slate-700 dark:text-slate-300 font-semibold block mb-2">One-Click Clinical Directives</label>
+                <div class="flex flex-wrap gap-1.5">
+                  <button onclick="sendQuickClinicalChat('Extend horizontal abduction by 5° to reach target arc')" class="text-[11px] px-3 py-1.5 rounded-xl bg-cyan-50 dark:bg-cyan-950/70 text-cyan-800 dark:text-cyan-300 border border-cyan-400/60 hover:bg-cyan-100 transition text-left font-medium">
+                    + Extend Abduction Arc
+                  </button>
+                  <button onclick="sendQuickClinicalChat('Excellent stability on horizontal adduction, keep it up!')" class="text-[11px] px-3 py-1.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-300 border border-emerald-400/60 hover:bg-emerald-100 transition text-left font-medium">
+                    ✓ Praise Form
+                  </button>
+                  <button onclick="sendQuickClinicalChat('Maintain steady angular speed along the arc curve')" class="text-[11px] px-3 py-1.5 rounded-xl bg-amber-50 dark:bg-amber-950/70 text-amber-800 dark:text-amber-300 border border-amber-400/60 hover:bg-amber-100 transition text-left font-medium">
+                    ⚠ Steady Speed
+                  </button>
+                  <button onclick="sendQuickClinicalChat('Let us take a 30-second resting break now')" class="text-[11px] px-3 py-1.5 rounded-xl bg-rose-50 dark:bg-rose-950/70 text-rose-800 dark:text-rose-300 border border-rose-400/60 hover:bg-rose-100 transition text-left font-medium">
+                    ⏸ 30s Rest Interval
+                  </button>
+                </div>
+              </div>
+
+            </div>
+          </div>
+
+          <div class="mt-4 pt-3 border-t border-slate-200 dark:border-slate-800 text-[11px] font-mono text-slate-500 dark:text-slate-400 flex items-center justify-between">
+            <span>Controller Link: Active</span>
+            <span class="text-emerald-600 dark:text-emerald-400 font-bold">PWM Duty: 184/255</span>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Real-time Broadcast Chat Component -->
+      <div class="glass-base p-5 rounded-3xl border border-slate-200 dark:border-slate-800 shadow-lg">
+        <div class="flex items-center justify-between mb-3 border-b border-slate-200 dark:border-slate-800 pb-3">
+          <div class="flex items-center space-x-3">
+            <div class="w-9 h-9 rounded-xl bg-cyan-100 dark:bg-cyan-950 text-cyan-600 dark:text-cyan-400 flex items-center justify-center font-bold">
+              <i class="fa-solid fa-comments"></i>
+            </div>
+            <div>
+              <h3 class="text-sm font-black text-slate-900 dark:text-white">Live Patient Channel (Zero-Latency BroadcastSync)</h3>
+              <p class="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Instant real-time channel between Doctor and Patient tabs with biofeedback sounds</p>
+            </div>
+          </div>
+          <div class="flex items-center space-x-2">
+            <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping"></span>
+            <span class="text-xs font-mono text-emerald-600 dark:text-emerald-400 font-bold">Live Synced</span>
+          </div>
+        </div>
+
+        <div id="doctorChatMessages" class="h-44 overflow-y-auto space-y-2.5 pr-2 text-xs font-sans"></div>
+
+        <form onsubmit="handleChatSubmit(event, 'Doctor')" class="mt-3 flex gap-2">
+          <input id="doctorChatInput" type="text" placeholder="Type clinical instruction or encourage John..." class="flex-grow bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-xl px-4 py-2.5 text-xs text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:border-cyan-500 transition shadow-inner">
+          <button type="submit" class="px-5 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-black text-xs flex items-center gap-2 transition shadow-md shadow-cyan-600/25">
+            <span>Send</span>
+            <i class="fa-solid fa-paper-plane"></i>
+          </button>
+        </form>
+      </div>
+
+    </div>
+  </section>
+
+  <section id="view-patient" class="view-fade view-hidden flex-grow relative z-10 px-4 sm:px-6 lg:px-8 py-6">
+    <div class="max-w-7xl mx-auto space-y-6">
+      
+      <!-- Patient Banner -->
+      <div class="glass-base p-5 rounded-3xl flex flex-wrap items-center justify-between gap-4 border border-violet-400/40 shadow-lg">
+        <div class="flex items-center space-x-4">
+          <div class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-violet-600 to-indigo-600 flex items-center justify-center text-white font-black shadow-lg shadow-violet-500/25">
+            <i class="fa-solid fa-gamepad text-2xl"></i>
+          </div>
+          <div>
+            <div class="flex items-center space-x-3">
+              <h2 class="text-xl sm:text-2xl font-black text-slate-900 dark:text-white" id="patientPortalHeading">RehabVR Table Tennis Arc Studio</h2>
+              <span class="px-2.5 py-0.5 rounded-full bg-violet-100 dark:bg-violet-950 text-violet-800 dark:text-violet-300 border border-violet-500/40 text-xs font-mono font-bold">
+                Arc-Board Active
+              </span>
+            </div>
+            <p class="text-xs text-slate-500 dark:text-slate-400 font-medium mt-0.5">
+              Exercise: <strong class="text-violet-700 dark:text-violet-300">Horizontal Arc Abduction & Adduction</strong> • Real-time Coach: <span class="text-cyan-700 dark:text-cyan-300 font-semibold">Dr. Venkata Ramana</span>
+            </p>
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-3 text-xs font-mono">
+          <div class="px-3.5 py-2 rounded-xl bg-white dark:bg-slate-900 border border-violet-300 dark:border-violet-700 text-violet-700 dark:text-violet-300 flex items-center gap-2 font-bold shadow-sm">
+            <i class="fa-solid fa-hand-holding-hand text-violet-500"></i>
+            <span>Haptic Load: <strong id="patientHapticIndicator" class="text-slate-900 dark:text-white">4.5 kg</strong></span>
+          </div>
+          <button onclick="calibrateHardware()" class="px-3.5 py-2 rounded-xl bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 flex items-center gap-2 transition font-bold shadow-sm">
+            <i class="fa-solid fa-arrows-rotate text-cyan-500"></i>
+            <span>Zero Calibrate</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+        
+        <!-- Interactive Canvas / Game Court -->
+        <div class="lg:col-span-3 glass-base p-5 rounded-3xl border border-violet-300 dark:border-violet-700 relative flex flex-col items-center justify-center overflow-hidden shadow-xl">
+          
+          <!-- Game Suite Switcher Tabs -->
+          <div class="w-full flex items-center justify-between flex-wrap gap-2 pb-3 mb-2 border-b border-slate-200 dark:border-slate-800">
+            <div class="flex items-center space-x-2">
+              <span class="text-xs font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1.5 font-mono">
+                <i class="fa-solid fa-gamepad text-violet-500"></i> SELECT GAME:
+              </span>
+            </div>
+            <div class="flex flex-wrap gap-1.5 p-1 bg-slate-100 dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 text-xs font-semibold shadow-inner">
+              <button id="btnGamePong" onclick="selectGame('pong')" class="px-3 py-1.5 rounded-lg bg-violet-600 text-white font-bold transition shadow-sm flex items-center gap-1.5">
+                <span>🏓</span> <span>Table Tennis</span>
+              </button>
+              <button id="btnGameShield" onclick="selectGame('shield')" class="px-3 py-1.5 rounded-lg text-slate-600 dark:text-slate-400 hover:text-cyan-600 transition flex items-center gap-1.5">
+                <span>🛡️</span> <span>Shield Defender</span>
+              </button>
+              <button id="btnGameKayak" onclick="selectGame('kayak')" class="px-3 py-1.5 rounded-lg text-slate-600 dark:text-slate-400 hover:text-emerald-600 transition flex items-center gap-1.5">
+                <span>🛶</span> <span>River Kayak</span>
+              </button>
+              <button id="btnGameHarp" onclick="selectGame('harp')" class="px-3 py-1.5 rounded-lg text-slate-600 dark:text-slate-400 hover:text-amber-600 transition flex items-center gap-1.5">
+                <span>🎵</span> <span>Laser Harp</span>
+              </button>
+              <button id="btnGameFruit" onclick="selectGame('fruit')" class="px-3 py-1.5 rounded-lg text-slate-600 dark:text-slate-400 hover:text-rose-600 transition flex items-center gap-1.5">
+                <span>🍎</span> <span>Fruit Catcher</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="w-full flex flex-wrap items-center justify-between px-3 py-2.5 text-xs font-mono text-slate-700 dark:text-slate-300 z-20 gap-2 border-b border-slate-200 dark:border-slate-800/80 mb-2">
+            <div class="flex items-center space-x-3 font-semibold flex-wrap gap-y-1">
+              <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span> ARC: ENGAGED</span>
+              <span class="text-slate-300 dark:text-slate-700 hidden sm:inline">|</span>
+              <span class="text-cyan-600 dark:text-cyan-400">ARC: <span id="gameHudArc" class="font-bold">90.0°</span></span>
+              <span class="text-slate-300 dark:text-slate-700 hidden sm:inline">|</span>
+              <span class="text-blue-600 dark:text-blue-400">SPEED: <span id="gameHudSpeed" class="font-bold">0.45 m/s</span></span>
+              <span class="text-slate-300 dark:text-slate-700 hidden sm:inline">|</span>
+              <span class="text-rose-600 dark:text-rose-400">SWINGS: <span id="gameHudSwings" class="font-bold">24 / 30</span> (<span id="gameHudSwingsPct" class="font-semibold">80%</span>)</span>
+              <span class="text-slate-300 dark:text-slate-700 hidden sm:inline">|</span>
+              <span class="text-emerald-600 dark:text-emerald-400">ACCURACY: <span id="gameHudAccuracy" class="font-bold">92.4%</span></span>
+            </div>
+            
+            <div class="flex items-center space-x-3">
+              <div class="text-violet-700 dark:text-violet-300 font-semibold"><span id="gameHudScoreLabel">HITS</span>: <span id="gameHudHits" class="font-bold text-slate-900 dark:text-white text-sm">24</span></div>
+              <div class="text-amber-600 dark:text-amber-300 font-semibold">STREAK: <span id="gameHudStreak" class="font-bold text-amber-500 text-sm">12</span> 🔥</div>
+
+              <!-- Pause & Stop Controls -->
+              <div class="flex items-center space-x-1.5 pl-2 border-l border-slate-200 dark:border-slate-700">
+                <button id="gamePauseResumeBtn" onclick="toggleGamePause()" class="px-2.5 py-1 rounded-lg bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 text-[11px] font-bold transition flex items-center gap-1.5 shadow-sm">
+                  <i class="fa-solid fa-pause text-cyan-500" id="gamePauseIcon"></i>
+                  <span id="gamePauseText">Pause</span>
+                </button>
+                <button onclick="stopGameSession()" class="px-2.5 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/60 hover:bg-rose-100 dark:hover:bg-rose-900/60 text-rose-700 dark:text-rose-300 border border-rose-300 dark:border-rose-700 text-[11px] font-bold transition flex items-center gap-1.5 shadow-sm" title="Stop exercise session">
+                  <i class="fa-solid fa-stop text-rose-500"></i>
+                  <span>Stop</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="relative w-full aspect-[16/9] max-h-[500px] bg-slate-950 rounded-2xl overflow-hidden border border-slate-800 shadow-2xl flex items-center justify-center cursor-ew-resize select-none">
+            <canvas id="gameCanvas" class="w-full h-full block"></canvas>
+
+            <div id="hapticFeedbackFlash" class="absolute inset-0 bg-cyan-400/20 pointer-events-none opacity-0 transition-opacity duration-150 border-4 border-cyan-400 rounded-2xl flex items-center justify-center">
+              <div class="px-5 py-2.5 rounded-xl bg-slate-900/95 border border-cyan-400 text-cyan-300 font-mono text-sm shadow-2xl tracking-wider animate-bounce font-bold">
+                <i class="fa-solid fa-wave-square mr-2 text-cyan-400"></i> HAPTIC IMPACT: 4.5 KG RESISTANCE
+              </div>
+            </div>
+
+            <div id="gamePauseOverlay" class="absolute inset-0 bg-slate-950/80 backdrop-blur-sm hidden flex-col items-center justify-center text-center p-6 z-25">
+              <div class="w-14 h-14 rounded-2xl bg-cyan-500/20 border border-cyan-400/40 flex items-center justify-center text-cyan-400 text-2xl mb-3 shadow-xl shadow-cyan-500/20">
+                <i class="fa-solid fa-pause"></i>
+              </div>
+              <h4 class="text-xl font-black text-white mb-1">Exercise Paused</h4>
+              <p class="text-xs text-slate-300 max-w-sm mb-4">Telemetry hold engaged. Take a breath and resume whenever ready.</p>
+              <button onclick="toggleGamePause()" class="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-black text-xs uppercase tracking-wider transition shadow-lg shadow-cyan-500/25">
+                <i class="fa-solid fa-play mr-2"></i> Resume Exercise
+              </button>
+            </div>
+
+            <div id="gameStartOverlay" class="absolute inset-0 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center text-center p-6 z-30 transition-all">
+              <div class="w-16 h-16 rounded-2xl bg-violet-500/20 border border-violet-400/40 flex items-center justify-center text-violet-400 text-3xl mb-4 shadow-xl shadow-violet-500/20" id="gameOverlayIconContainer">
+                <i class="fa-solid fa-table-tennis-paddle-ball" id="gameOverlayIcon"></i>
+              </div>
+              <h3 class="text-2xl sm:text-3xl font-black text-white mb-2" id="gameOverlayTitle">RehabVR Table Tennis Arc Exercise</h3>
+              <p class="text-sm text-slate-300 max-w-md mb-6 leading-relaxed font-normal" id="gameOverlaySubtitle">
+                Glide your paddle horizontally along the reverse-U curved trajectory. Return the ball to train horizontal shoulder abduction and wrist stability.
+              </p>
+              <button onclick="startGameSimulation()" class="px-8 py-3.5 rounded-xl bg-gradient-to-r from-violet-600 via-blue-600 to-cyan-500 hover:from-violet-500 hover:to-cyan-400 text-white font-black text-sm tracking-wider uppercase transition shadow-xl shadow-cyan-500/25 transform hover:scale-105">
+                <i class="fa-solid fa-play mr-2" id="gameStartBtnIcon"></i> <span id="gameStartBtnText">Begin Rehabilitation Session</span>
+              </button>
+              <span class="text-xs font-mono text-slate-400 mt-3 font-semibold">Supports VR Controllers, Mouse Sweep & Physical Arc Slider</span>
+            </div>
+          </div>
+
+          <div class="w-full mt-4 p-4 rounded-2xl bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-sm">
+            <div class="flex items-center space-x-3">
+              <div class="w-9 h-9 rounded-xl bg-cyan-100 dark:bg-cyan-950 text-cyan-600 dark:text-cyan-400 flex items-center justify-center">
+                <i class="fa-solid fa-arrows-left-right text-lg"></i>
+              </div>
+              <div>
+                <div class="text-xs font-extrabold text-slate-900 dark:text-white">Tracked Movement Arc Slider Control</div>
+                <div class="text-[11px] text-slate-500 dark:text-slate-400">Glide horizontally: Left Adduction (55°) &rarr; Neutral (90°) &rarr; Right Abduction (125°)</div>
+              </div>
+            </div>
+            
+            <div class="flex-grow max-w-md w-full px-2">
+              <input id="arcBoardSlider" type="range" min="0" max="100" value="50" oninput="handleArcSliderChange(this.value)" class="w-full h-3 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-ew-resize accent-cyan-500 border border-slate-300 dark:border-slate-700">
+              <div class="flex justify-between text-[10px] font-mono text-slate-500 dark:text-slate-400 mt-1 font-medium">
+                <span>Left Adduction (55°)</span>
+                <span>Neutral (90°)</span>
+                <span>Right Abduction (125°)</span>
+              </div>
+            </div>
+
+            <div class="flex items-center space-x-2">
+              <button onclick="triggerHapticPulse('patient_paddle')" class="px-3.5 py-2 rounded-xl bg-violet-100 dark:bg-violet-950 hover:bg-violet-200 dark:hover:bg-violet-900 border border-violet-400 text-violet-800 dark:text-violet-300 text-xs font-bold transition shadow-sm">
+                <i class="fa-solid fa-wave-square mr-1.5"></i> Pulse Haptic
+              </button>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Clinical Guidance and Patient Chat Panel -->
+        <div class="glass-base p-5 rounded-3xl border border-violet-300 dark:border-violet-700 flex flex-col justify-between space-y-4 shadow-lg">
+          <div>
+            <div class="flex items-center justify-between mb-3 border-b border-slate-200 dark:border-slate-700 pb-2">
+              <h3 class="text-sm font-black text-slate-900 dark:text-white flex items-center gap-2">
+                <i class="fa-solid fa-clipboard-check text-cyan-500"></i>
+                Clinical Guidance
+              </h3>
+              <span class="text-[11px] font-mono text-cyan-700 dark:text-cyan-300 font-bold">Dr. V. Ramana</span>
+            </div>
+
+            <div class="space-y-2.5 text-xs text-slate-600 dark:text-slate-300">
+              <div class="p-3 rounded-2xl bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 shadow-sm">
+                <div class="font-bold text-cyan-700 dark:text-cyan-300 mb-1 flex items-center gap-1.5">
+                  <i class="fa-solid fa-person-military-pointing"></i> 1. Horizontal Motion
+                </div>
+                <p class="text-slate-500 dark:text-slate-400 text-[11px] leading-relaxed">
+                  Keep elbow supported at 90°. Follow the curved U-path outward to train horizontal shoulder abduction.
+                </p>
+              </div>
+
+              <div class="p-3 rounded-2xl bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 shadow-sm">
+                <div class="font-bold text-violet-700 dark:text-violet-300 mb-1 flex items-center gap-1.5">
+                  <i class="fa-solid fa-dumbbell"></i> 2. Dynamic Resistance
+                </div>
+                <p class="text-slate-500 dark:text-slate-400 text-[11px] leading-relaxed">
+                  Current push resistance is set to <strong class="text-slate-900 dark:text-white font-mono" id="patientCoachResistance">4.5 kg</strong>. Maintain constant speed without sudden jerks.
+                </p>
+              </div>
+
+              <div class="p-3 rounded-2xl bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 shadow-sm">
+                <div class="font-bold text-emerald-700 dark:text-emerald-300 mb-1 flex items-center gap-1.5">
+                  <i class="fa-solid fa-award"></i> 3. Session Goal
+                </div>
+                <p class="text-slate-500 dark:text-slate-400 text-[11px] leading-relaxed">
+                  Target: 30 swings. Total Swings: <strong class="text-rose-600 dark:text-rose-400 font-mono font-bold" id="patientCoachSwings">24 / 30</strong>.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div class="pt-3 border-t border-slate-200 dark:border-slate-700">
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-xs font-black text-slate-900 dark:text-white flex items-center gap-1.5">
+                <i class="fa-solid fa-comment-medical text-violet-500"></i> Doctor Channel
+              </span>
+              <span class="text-[10px] font-mono text-emerald-600 dark:text-emerald-400 font-bold">Connected</span>
+            </div>
+
+            <div id="patientChatMessages" class="h-40 overflow-y-auto space-y-2 pr-1 text-xs font-sans"></div>
+
+            <form onsubmit="handleChatSubmit(event, 'Patient')" class="mt-2.5 flex gap-1.5">
+              <input id="patientChatInput" type="text" placeholder="Message Dr. Ramana..." class="flex-grow bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-xl px-3.5 py-2 text-xs text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:border-violet-500 transition shadow-inner">
+              <button type="submit" class="px-3.5 py-2 rounded-xl bg-violet-600 hover:bg-violet-500 text-white font-bold text-xs flex items-center transition shadow-md shadow-violet-600/20">
+                <i class="fa-solid fa-paper-plane"></i>
+              </button>
+            </form>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+  </section>
+
+  <!-- Toast Notification Component -->
+  <div id="toastNotification" class="fixed bottom-5 right-5 z-50 transform translate-y-24 opacity-0 transition-all duration-300 pointer-events-none flex items-center space-x-3 p-4 rounded-2xl bg-white/95 dark:bg-slate-900/95 border border-cyan-400 shadow-2xl backdrop-blur-xl">
+    <div id="toastIconContainer" class="w-8 h-8 rounded-lg bg-cyan-100 dark:bg-cyan-950 text-cyan-600 dark:text-cyan-400 flex items-center justify-center text-base">
+      <i id="toastIcon" class="fa-solid fa-bell"></i>
+    </div>
+    <div>
+      <div id="toastTitle" class="text-xs font-black text-slate-900 dark:text-white">Notification</div>
+      <div id="toastMessage" class="text-xs text-slate-600 dark:text-slate-300">Message details here</div>
+    </div>
+  </div>
+
+  <footer class="mt-auto z-10 glass-base border-t border-slate-200 dark:border-slate-800 py-4 px-4 sm:px-6 lg:px-8">
+    <div class="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 dark:text-slate-400 gap-2 font-mono">
+      <div class="flex items-center space-x-2">
+        <span>SAHAAYA RehabVR © 2026</span>
+        <span>•</span>
+        <span class="text-cyan-600 dark:text-cyan-400">Intelligent Upper-Limb Rehabilitation Platform</span>
+      </div>
+      <div class="flex items-center space-x-4">
+        <span>AIIMS Bhubaneswar Clinical Guidance</span>
+        <span class="text-emerald-600 dark:text-emerald-400 font-bold">● VR Controller Telemetry Active</span>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    // Helper to update the top status pill badge
+    function updateVRStatusBadge(active, labelText) {
+      const espLabel = document.getElementById('espStatusLabel');
+      const espDot = document.getElementById('espDot');
+      const espPing = document.getElementById('espPing');
+      if (!espLabel) return;
+
+      espLabel.innerText = labelText;
+      if (active) {
+        espLabel.className = 'text-emerald-600 dark:text-emerald-400 font-bold ml-1 animate-pulse';
+        if (espDot) espDot.className = 'relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500';
+        if (espPing) espPing.className = 'animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-75';
+      } else {
+        espLabel.className = 'text-amber-600 dark:text-amber-400 font-bold ml-1';
+        if (espDot) espDot.className = 'relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500';
+        if (espPing) espPing.className = 'hidden';
+      }
+    }
+
+    // Handles live packets directly from Unity Meta Quest 2
+    window.handleRemoteVRPacket = function(data) {
+      if (!data) return;
+
+      updateVRStatusBadge(true, "VR HEADSET LIVE (SYNCED)");
+      AppState.streamingActive = true;
+
+      // Extract telemetry object whether Unity puts it at top level or nested under .telemetry
+      const p = (data.telemetry && typeof data.telemetry === 'object') ? data.telemetry : data;
+
+      // 1. Session & Patient Identification from Unity profile
+      const patId = p.patientId || data.patientId;
+      if (patId && typeof patId === 'string') {
+        AppState.patientId = patId;
+        const pBadge = document.getElementById('docBadgePatient');
+        if (pBadge) pBadge.innerText = `${patId} (Unity Quest Session)`;
+      }
+
+      const sessId = p.sessionId || data.sessionId;
+      if (sessId && typeof sessId === 'string') {
+        AppState.sessionId = sessId;
+        const sBadge = document.getElementById('docBadgeSession');
+        if (sBadge) sBadge.innerText = sessId;
+      }
+
+      // 2. Session Lifecycle (TELEMETRY ONLY - Never auto-starts local games)
+      const sessStatus = p.sessionStatus || data.sessionStatus;
+      if (sessStatus) {
+        const modeBadge = document.getElementById('docBadgeMode');
+        if (modeBadge) modeBadge.innerText = `VR: ${sessStatus.toUpperCase()}`;
+      }
+
+      // 3. Clinical Telemetry Kinematics - extracts from top-level or nested payload
+      const getNum = (key) => {
+        const v = p[key] !== undefined ? p[key] : data[key];
+        return typeof v === 'number' ? Number(v) : null;
+      };
+
+      const arc = getNum('movementArc');
+      if (arc !== null) AppState.telemetry.movementArc = arc;
+
+      const spd = getNum('movementSpeed');
+      if (spd !== null) AppState.telemetry.movementSpeed = spd;
+
+      const angSpd = getNum('angularSpeed');
+      if (angSpd !== null) AppState.telemetry.angularSpeed = angSpd;
+
+      const smt = getNum('movementSmoothness');
+      if (smt !== null) AppState.telemetry.movementSmoothness = smt;
+
+      const swg = getNum('swingCount');
+      if (swg !== null) AppState.telemetry.swingCount = swg;
+
+      const tSwg = getNum('targetSwings');
+      if (tSwg !== null) AppState.telemetry.targetSwings = tSwg;
+
+      const hits = getNum('successfulHits');
+      if (hits !== null) AppState.telemetry.successfulHits = hits;
+
+      const mss = getNum('missedBalls');
+      if (mss !== null) AppState.telemetry.missedBalls = mss;
+
+      const acc = getNum('hitAccuracy');
+      if (acc !== null) AppState.telemetry.hitAccuracy = acc;
+
+      const strk = getNum('currentStreak');
+      if (strk !== null) AppState.telemetry.currentStreak = strk;
+
+      const bStrk = getNum('bestStreak');
+      if (bStrk !== null) AppState.telemetry.bestStreak = bStrk;
+
+      const fh = getNum('forehandCount');
+      if (fh !== null) AppState.telemetry.forehandCount = fh;
+
+      const bh = getNum('backhandCount');
+      if (bh !== null) AppState.telemetry.backhandCount = bh;
+
+      const rTime = getNum('reactionTimeMs');
+      if (rTime !== null) AppState.telemetry.reactionTimeMs = rTime;
+
+      // 4. Controller Pose mapping (3D Quest pose with 2D U-arc fallback)
+      const pose = p.paddlePosition || data.paddlePosition;
+      if (pose && typeof pose.x === 'number') {
+        const normX = Math.max(0.05, Math.min(0.95, (pose.x + 0.35) / 0.7));
+        GameState.playerPaddle.x = normX;
+        
+        if (typeof pose.y === 'number') {
+          GameState.playerPaddle.y = Math.max(0.75, Math.min(0.95, 0.90 - (pose.y - 1.0) * 0.25));
+        }
+      } else {
+        const normalized = Math.max(0, Math.min(1, (AppState.telemetry.movementArc - 55) / 70));
+        GameState.playerPaddle.x = normalized;
+        const uShape = 1.0 - Math.pow((normalized - 0.5) * 2.1, 2);
+        GameState.playerPaddle.y = 0.90 - Math.max(0, uShape) * 0.08;
+      }
+
+      // Quaternion rotation mapping (pitch / roll from Quest headset controller)
+      const rot = p.paddleRotation || data.paddleRotation;
+      if (rot && typeof rot.z === 'number') {
+        GameState.playerPaddle.rollAngle = -rot.z * 1.8;
+      }
+
+      const arcSlider = document.getElementById('arcBoardSlider');
+      if (arcSlider) arcSlider.value = Math.round(GameState.playerPaddle.x * 100);
+
+      // Update telemetry gauges and multi-channel waveforms exclusively from VR
+      updateDashboardKPIs();
+    };
+
+    // Spotlight cursor follower
+    const cursorLight = document.getElementById('cursorLight');
+    window.addEventListener('mousemove', (e) => {
+      if (cursorLight) {
+        cursorLight.style.left = e.clientX + 'px';
+        cursorLight.style.top = e.clientY + 'px';
+      }
+    });
+
+    let toastTimer = null;
+    function showToast(title, message, iconClass = 'fa-bell') {
+      const toast = document.getElementById('toastNotification');
+      const tTitle = document.getElementById('toastTitle');
+      const tMsg = document.getElementById('toastMessage');
+      const tIcon = document.getElementById('toastIcon');
+
+      if (!toast || !tTitle || !tMsg) return;
+
+      tTitle.innerText = title;
+      tMsg.innerText = message;
+      if (tIcon) {
+        tIcon.className = `fa-solid ${iconClass.startsWith('fa-') ? iconClass : 'fa-' + iconClass}`;
+      }
+
+      toast.classList.remove('translate-y-24', 'opacity-0', 'pointer-events-none');
+      toast.classList.add('translate-y-0', 'opacity-100');
+
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => {
+        toast.classList.remove('translate-y-0', 'opacity-100');
+        toast.classList.add('translate-y-24', 'opacity-0', 'pointer-events-none');
+      }, 3000);
+    }
+
+    function toggleTheme() {
+      const html = document.documentElement;
+      const themeIcon = document.getElementById('themeIcon');
+      if (html.classList.contains('dark')) {
+        html.classList.remove('dark');
+        html.classList.add('light');
+        themeIcon.className = 'fa-solid fa-sun text-sm';
+        showToast('Light Theme Active', 'Luminous clinical aesthetics engaged.', 'fa-sun');
+      } else {
+        html.classList.remove('light');
+        html.classList.add('dark');
+        themeIcon.className = 'fa-solid fa-moon text-sm';
+        showToast('Dark Theme Active', 'Cyber-medical contrast palette engaged.', 'fa-moon');
+      }
+    }
+
+    const AppState = {
+      currentView: 'landing',
+      soundEnabled: true,
+      streamingActive: true,
+      resistanceKg: 4.5,
+      vibrationIntensity: 75,
+      gamePace: 'normal',
+      
+      // Clinical Metadata
+      patientId: 'PAT-2026-081',
+      sessionId: 'SESS-12',
+      gameMode: 'AI Opponent',
+      difficulty: 'Medium',
+      sessionSeconds: 872,
+
+      // VR Controller Extracted Kinematics
+      telemetry: {
+        movementArc: 90.0,          // Tracked Movement Arc (55° - 125°)
+        movementSpeed: 0.45,        // Hand/Bat movement speed (m/s)
+        angularSpeed: 35.2,         // Rotational angular speed (°/s)
+        movementSmoothness: 0.89,   // Smoothness metric (0.0 - 1.0)
+        swingCount: 24,             // Swings completed
+        targetArc: 120.0,           // Prescribed target arc
+        targetSwings: 30,           // Prescribed quota of swings
+        
+        // Calculated / Session Derived Metrics
+        successfulHits: 24,
+        missedBalls: 2,
+        hitAccuracy: 92.4,
+        currentStreak: 12,
+        bestStreak: 16,
+        forehandCount: 14,
+        backhandCount: 10,
+        reactionTimeMs: 340,
+
+        lastArcTimestamp: Date.now(),
+        lastArcVal: 90.0
+      },
+
+      chatMessages: [
+        { sender: 'Doctor', role: 'Therapist', text: 'Welcome John! Let\'s begin Session #12. Keep an eye on Tracked Movement Arc between 60° and 120°.', timestamp: '10:42 AM' },
+        { sender: 'Patient', role: 'Patient', text: 'Hello Dr. Ramana, feeling ready today! Hand controller tracking feels responsive.', timestamp: '10:43 AM' },
+        { sender: 'Doctor', role: 'Therapist', text: 'Great. Maintain a smooth swing pace and consistent stroke direction.', timestamp: '10:44 AM' }
+      ]
+    };
+
+    // Session Timer Ticker
+    setInterval(() => {
+      if (AppState.streamingActive) {
+        AppState.sessionSeconds++;
+        const mins = Math.floor(AppState.sessionSeconds / 60);
+        const secs = AppState.sessionSeconds % 60;
+        const timerEl = document.getElementById('docSessionTimer');
+        if (timerEl) {
+          timerEl.innerText = `${mins}m ${secs < 10 ? '0' : ''}${secs}s`;
+        }
+      }
+    }, 1000);
+
+    // Cross-Tab BroadcastChannel
+    let syncChannel;
+    try {
+      syncChannel = new BroadcastChannel('rehabvr_sync_channel_live');
+      syncChannel.onmessage = (event) => {
+        handleIncomingSyncMessage(event.data);
+      };
+    } catch (e) {
+      console.warn('BroadcastChannel fallback');
+    }
+
+    const STORAGE_KEY_CHAT = 'rehabvr_chat_history_v3';
+    const STORAGE_KEY_CONFIG = 'rehabvr_config_sync_v3';
+
+    try {
+      const savedChat = localStorage.getItem(STORAGE_KEY_CHAT);
+      if (savedChat) {
+        AppState.chatMessages = JSON.parse(savedChat);
+      }
+    } catch(e) {}
+
+    let audioCtx = null;
+    function getAudioContext() {
+      if (!audioCtx) {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (AudioContext) {
+          audioCtx = new AudioContext();
+        }
+      }
+      if (audioCtx && audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+      return audioCtx;
+    }
+
+    function playTone(freq, type = 'sine', duration = 0.12, volume = 0.15) {
+      if (!AppState.soundEnabled) return;
+      try {
+        const ctx = getAudioContext();
+        if (!ctx) return;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, ctx.currentTime);
+        gain.gain.setValueAtTime(volume, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + duration);
+      } catch (err) {}
+    }
+
+    function playPaddleHitSound() {
+      playTone(540, 'triangle', 0.09, 0.2);
+    }
+    function playScoreSound() {
+      playTone(880, 'sine', 0.2, 0.25);
+    }
+    function playHapticPingSound() {
+      playTone(160, 'sawtooth', 0.18, 0.25);
+      if (navigator.vibrate) {
+        navigator.vibrate([40, 30, 40]);
+      }
+    }
+
+    function toggleAudio() {
+      AppState.soundEnabled = !AppState.soundEnabled;
+      const btn = document.getElementById('soundToggleBtn');
+      const icon = document.getElementById('soundIcon');
+      if (AppState.soundEnabled) {
+        icon.className = 'fa-solid fa-volume-high text-sm';
+        btn.classList.add('text-cyan-500');
+        showToast('Audio Active', 'Synthesized chimes enabled.', 'fa-volume-high');
+        playTone(600, 'sine', 0.1);
+      } else {
+        icon.className = 'fa-solid fa-volume-xmark text-sm';
+        btn.classList.remove('text-cyan-500');
+        showToast('Audio Muted', 'Synthesized sound muted.', 'fa-volume-xmark');
+      }
+    }
+
+    function switchView(viewName) {
+      AppState.currentView = viewName;
+
+      const views = {
+        landing: document.getElementById('view-landing'),
+        doctor: document.getElementById('view-doctor'),
+        patient: document.getElementById('view-patient')
+      };
+
+      const navBtns = {
+        landing: document.getElementById('navBtnLanding'),
+        doctor: document.getElementById('navBtnDoctor'),
+        patient: document.getElementById('navBtnPatient')
+      };
+
+      Object.keys(views).forEach(key => {
+        if (views[key]) {
+          views[key].classList.remove('view-visible');
+          views[key].classList.add('view-hidden');
+        }
+        if (navBtns[key]) {
+          navBtns[key].classList.remove('bg-white', 'dark:bg-slate-800', 'text-slate-900', 'dark:text-white', 'shadow-sm', 'font-bold');
+          navBtns[key].classList.add('text-slate-600', 'dark:text-slate-400');
+        }
+      });
+
+      if (views[viewName]) {
+        views[viewName].classList.remove('view-hidden');
+        views[viewName].classList.add('view-visible');
+      }
+
+      if (navBtns[viewName]) {
+        navBtns[viewName].classList.remove('text-slate-600', 'dark:text-slate-400');
+        navBtns[viewName].classList.add('bg-white', 'dark:bg-slate-800', 'text-slate-900', 'dark:text-white', 'shadow-sm', 'font-bold');
+      }
+
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+
+      if (viewName === 'doctor') {
+        renderChatMessages();
+        resizeTelemetryCanvas();
+        updateDashboardKPIs();
+      } else if (viewName === 'patient') {
+        renderChatMessages();
+        resizeGameCanvas();
+        updateDashboardKPIs();
+      }
+    }
+
+    // Chat System & Deduplication
+    function renderChatMessages() {
+      const docBox = document.getElementById('doctorChatMessages');
+      const patBox = document.getElementById('patientChatMessages');
+
+      const html = AppState.chatMessages.map(msg => {
+        const isDoc = msg.sender.toLowerCase().includes('doc');
+        return `
+          <div class="p-3 rounded-2xl ${isDoc ? 'bg-cyan-50 dark:bg-cyan-950/50 border border-cyan-300 dark:border-cyan-500/30' : 'bg-violet-50 dark:bg-violet-950/50 border border-violet-300 dark:border-violet-500/30'} shadow-sm">
+            <div class="flex items-center justify-between text-[10px] text-slate-500 dark:text-slate-400 font-mono mb-1">
+              <span class="font-extrabold ${isDoc ? 'text-cyan-700 dark:text-cyan-300' : 'text-violet-700 dark:text-violet-300'} flex items-center gap-1.5">
+                <i class="fa-solid ${isDoc ? 'fa-user-doctor' : 'fa-user'}"></i> ${msg.sender} (${msg.role})
+              </span>
+              <span>${msg.timestamp}</span>
+            </div>
+            <p class="text-xs text-slate-800 dark:text-slate-200 leading-relaxed">${escapeHtml(msg.text)}</p>
+          </div>
+        `;
+      }).join('');
+
+      if (docBox) {
+        docBox.innerHTML = html;
+        docBox.scrollTop = docBox.scrollHeight;
+      }
+      if (patBox) {
+        patBox.innerHTML = html;
+        patBox.scrollTop = patBox.scrollHeight;
+      }
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function handleChatSubmit(e, sender) {
+      e.preventDefault();
+      const inputId = sender === 'Doctor' ? 'doctorChatInput' : 'patientChatInput';
+      const input = document.getElementById(inputId);
+      const text = input ? input.value.trim() : '';
+
+      if (!text) return;
+
+      const now = new Date();
+      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+      const newMsg = {
+        sender: sender,
+        role: sender === 'Doctor' ? 'Therapist' : 'Patient',
+        text: text,
+        timestamp: timeStr
+      };
+
+      AppState.chatMessages.push(newMsg);
+      input.value = '';
+      renderChatMessages();
+
+      playTone(sender === 'Doctor' ? 700 : 850, 'sine', 0.1);
+      broadcastSyncPayload({ type: 'CHAT_MESSAGE', payload: newMsg });
+
+      try {
+        localStorage.setItem(STORAGE_KEY_CHAT, JSON.stringify(AppState.chatMessages));
+      } catch (err) {}
+    }
+
+    function sendQuickClinicalChat(text) {
+      const now = new Date();
+      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const newMsg = {
+        sender: 'Doctor',
+        role: 'Therapist Directive',
+        text: text,
+        timestamp: timeStr
+      };
+
+      AppState.chatMessages.push(newMsg);
+      renderChatMessages();
+      playTone(720, 'sine', 0.12);
+      broadcastSyncPayload({ type: 'CHAT_MESSAGE', payload: newMsg });
+
+      try {
+        localStorage.setItem(STORAGE_KEY_CHAT, JSON.stringify(AppState.chatMessages));
+      } catch (err) {}
+    }
+
+    function broadcastSyncPayload(data) {
+      if (syncChannel) {
+        syncChannel.postMessage(data);
+      }
+      try {
+        localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify({ data, timestamp: Date.now() }));
+      } catch (e) {}
+    }
+
+    function syncHapticControlsUI() {
+      const resLabel = document.getElementById('labelResistance');
+      const vibLabel = document.getElementById('labelVibration');
+      const resSlider = document.getElementById('sliderResistance');
+      const vibSlider = document.getElementById('sliderVibration');
+      const patRes = document.getElementById('patientHapticIndicator');
+      const patCoachRes = document.getElementById('patientCoachResistance');
+
+      if (resLabel) resLabel.innerText = `${AppState.resistanceKg.toFixed(1)} kg`;
+      if (vibLabel) vibLabel.innerText = `${AppState.vibrationIntensity} %`;
+      if (resSlider) resSlider.value = AppState.resistanceKg;
+      if (vibSlider) vibSlider.value = AppState.vibrationIntensity;
+      if (patRes) patRes.innerText = `${AppState.resistanceKg.toFixed(1)} kg`;
+      if (patCoachRes) patCoachRes.innerText = `${AppState.resistanceKg.toFixed(1)} kg`;
+    }
+
+    function updateResistance(val) {
+      AppState.resistanceKg = parseFloat(val);
+      syncHapticControlsUI();
+      broadcastSyncPayload({
+        type: 'HAPTIC_UPDATE',
+        resistance: AppState.resistanceKg,
+        vibration: AppState.vibrationIntensity
+      });
+    }
+
+    function updateVibration(val) {
+      AppState.vibrationIntensity = parseInt(val, 10);
+      syncHapticControlsUI();
+      broadcastSyncPayload({
+        type: 'HAPTIC_UPDATE',
+        resistance: AppState.resistanceKg,
+        vibration: AppState.vibrationIntensity
+      });
+    }
+
+    function setGamePace(pace) {
+      AppState.gamePace = pace;
+      const btnGentle = document.getElementById('btnPaceGentle');
+      const btnNormal = document.getElementById('btnPaceNormal');
+      const btnBrisk = document.getElementById('btnPaceBrisk');
+
+      [btnGentle, btnNormal, btnBrisk].forEach(b => {
+        if (b) b.className = 'py-2 text-xs font-bold rounded-xl bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 transition';
+      });
+
+      if (pace === 'gentle') {
+        if (btnGentle) btnGentle.className = 'py-2 text-xs font-bold rounded-xl bg-cyan-600 text-white border border-cyan-600 transition shadow-sm';
+        ballSpeedModifier = 0.7;
+      } else if (pace === 'normal') {
+        if (btnNormal) btnNormal.className = 'py-2 text-xs font-bold rounded-xl bg-cyan-600 text-white border border-cyan-600 transition shadow-sm';
+        ballSpeedModifier = 1.0;
+      } else if (pace === 'brisk') {
+        if (btnBrisk) btnBrisk.className = 'py-2 text-xs font-bold rounded-xl bg-cyan-600 text-white border border-cyan-600 transition shadow-sm';
+        ballSpeedModifier = 1.4;
+      }
+      showToast('Exercise Pace Updated', `Object speed set to ${pace.toUpperCase()}`, 'fa-gauge');
+    }
+
+    function toggleTelemetryStream() {
+      AppState.streamingActive = !AppState.streamingActive;
+      const btnText = document.getElementById('streamBtnText');
+      const btnIcon = document.getElementById('streamBtnIcon');
+      const espDot = document.getElementById('espDot');
+      const espPing = document.getElementById('espPing');
+      const espLabel = document.getElementById('espStatusLabel');
+
+      if (AppState.streamingActive) {
+        if (btnText) btnText.innerText = 'Stream Active';
+        if (btnIcon) btnIcon.className = 'fa-solid fa-pause';
+        if (espDot) espDot.className = 'relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500';
+        if (espPing) espPing.className = 'animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-75';
+        if (espLabel) {
+          espLabel.innerText = 'LIVE INGESTION (5Hz)';
+          espLabel.className = 'text-emerald-600 dark:text-emerald-400 font-bold ml-1';
+        }
+        showToast('Stream Resumed', 'Live telemetry link re-engaged.', 'fa-satellite-dish');
+      } else {
+        if (btnText) btnText.innerText = 'Stream Paused';
+        if (btnIcon) btnIcon.className = 'fa-solid fa-play';
+        if (espDot) espDot.className = 'relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500';
+        if (espPing) espPing.className = 'hidden';
+        if (espLabel) {
+          espLabel.innerText = 'STREAM PAUSED';
+          espLabel.className = 'text-amber-600 dark:text-amber-400 font-bold ml-1';
+        }
+        showToast('Stream Paused', 'Data capture held.', 'fa-pause');
+      }
+    }
+
+    function handleIncomingSyncMessage(data) {
+      if (!data) return;
+      if (data.type === 'CHAT_MESSAGE') {
+        const isDuplicate = AppState.chatMessages.some(m => 
+          m.text === data.payload.text && 
+          m.timestamp === data.payload.timestamp && 
+          m.sender === data.payload.sender
+        );
+        if (!isDuplicate) {
+          AppState.chatMessages.push(data.payload);
+          renderChatMessages();
+          playTone(650, 'triangle', 0.15);
+        }
+      } else if (data.type === 'HAPTIC_UPDATE') {
+        AppState.resistanceKg = data.resistance;
+        AppState.vibrationIntensity = data.vibration;
+        syncHapticControlsUI();
+        triggerHapticVisualFeedback();
+      } else if (data.type === 'HAPTIC_PULSE') {
+        triggerHapticVisualFeedback();
+      } else if (data.type === 'TELEMETRY_SYNC' || data.type === 'VR_HARDWARE_PACKET') {
+        if (data.telemetry) {
+          AppState.telemetry = { ...AppState.telemetry, ...data.telemetry };
+          
+          // Sync paddle physical position with the incoming VR controller arc
+          if (typeof data.telemetry.movementArc === 'number') {
+            const normalized = Math.max(0, Math.min(1, (data.telemetry.movementArc - 55) / 70));
+            GameState.playerPaddle.x = normalized;
+            const uShape = 1.0 - Math.pow((normalized - 0.5) * 2.1, 2);
+            GameState.playerPaddle.y = 0.90 - Math.max(0, uShape) * 0.08;
+            
+            const arcSlider = document.getElementById('arcBoardSlider');
+            if (arcSlider) arcSlider.value = Math.round(normalized * 100);
+          }
+
+          // Update header live link status indicator
+          const espLabel = document.getElementById('espStatusLabel');
+          const espDot = document.getElementById('espDot');
+          const espPing = document.getElementById('espPing');
+          if (espLabel) {
+            espLabel.innerText = 'VR CONTROLLER LIVE (SYNCED)';
+            espLabel.className = 'text-emerald-500 font-bold ml-1 animate-pulse';
+          }
+          if (espDot) espDot.className = 'relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500';
+          if (espPing) espPing.className = 'animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-75';
+        }
+        updateDashboardKPIs();
+      }
+    }
+
+    function triggerHapticPulse(source) {
+      playHapticPingSound();
+      triggerHapticVisualFeedback();
+      broadcastSyncPayload({ type: 'HAPTIC_PULSE', source });
+      if (source === 'doctor_request') {
+        showToast('Haptic Ping Dispatched', `Simulated pulse sent at ${AppState.resistanceKg}kg resistance`, 'fa-wave-square');
+      }
+    }
+
+    function triggerHapticVisualFeedback() {
+      const flash = document.getElementById('hapticFeedbackFlash');
+      if (flash) {
+        flash.style.opacity = '1';
+        setTimeout(() => {
+          flash.style.opacity = '0';
+        }, 320);
+      }
+    }
+
+    function calibrateHardware() {
+      playTone(800, 'square', 0.15);
+      showToast('Neutral Calibrated', 'Arc zeroed: Tracked Movement Arc = 90.0°', 'fa-arrows-rotate');
+      setPaddleNormalizedX(0.5);
+    }
+
+    function exportTelemetryCSV() {
+      const headers = ['Timestamp', 'TrackedMovementArc_Deg', 'MovementSpeed_Mps', 'AngularSpeed_DegSec', 'MovementSmoothness', 'SwingsCompleted', 'HitAccuracy_Pct', 'CurrentStreak'];
+      const rows = telemetryHistory.map((item, idx) => [
+        new Date(Date.now() - (telemetryHistory.length - idx) * 100).toISOString(),
+        item.arc.toFixed(2),
+        item.speed.toFixed(2),
+        item.angularSpeed.toFixed(2),
+        AppState.telemetry.movementSmoothness.toFixed(2),
+        AppState.telemetry.swingCount,
+        AppState.telemetry.hitAccuracy.toFixed(1),
+        AppState.telemetry.currentStreak
+      ]);
+
+      const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+      const encodedUri = encodeURI(csvContent);
+      const link = document.createElement('a');
+      link.setAttribute('href', encodedUri);
+      link.setAttribute('download', `RehabVR_Session12_${Date.now()}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      showToast('CSV Exported', 'Downloaded full session kinematic log.', 'fa-file-csv');
+    }
+
+    const telemetryCanvas = document.getElementById('telemetryCanvas');
+    const tCtx = telemetryCanvas ? telemetryCanvas.getContext('2d') : null;
+    let telemetryHistory = [];
+    const maxDataPoints = 140;
+
+    for (let i = 0; i < maxDataPoints; i++) {
+      telemetryHistory.push({
+        arc: 90.0,
+        speed: 0.45,
+        angularSpeed: 35.0
+      });
+    }
+
+    function resizeTelemetryCanvas() {
+      if (!telemetryCanvas) return;
+      const rect = telemetryCanvas.parentElement.getBoundingClientRect();
+      telemetryCanvas.width = rect.width;
+      telemetryCanvas.height = rect.height;
+    }
+
+    function drawTelemetryWaveforms() {
+      if (!tCtx || !telemetryCanvas) return;
+      const w = telemetryCanvas.width;
+      const h = telemetryCanvas.height;
+
+      tCtx.clearRect(0, 0, w, h);
+
+      // Grid background
+      tCtx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
+      tCtx.lineWidth = 1;
+      const gridRows = 6;
+      for (let r = 1; r < gridRows; r++) {
+        const y = (h / gridRows) * r;
+        tCtx.beginPath();
+        tCtx.moveTo(0, y);
+        tCtx.lineTo(w, y);
+        tCtx.stroke();
+      }
+
+      // 60° to 120° Target Arc Range Shaded Band
+      const targetMinY = h - Math.max(0, Math.min(1, (60 - 50) / 80)) * (h - 28) - 14;
+      const targetMaxY = h - Math.max(0, Math.min(1, (120 - 50) / 80)) * (h - 28) - 14;
+      tCtx.fillStyle = 'rgba(16, 185, 129, 0.08)';
+      tCtx.fillRect(0, targetMaxY, w, targetMinY - targetMaxY);
+
+      tCtx.strokeStyle = 'rgba(16, 185, 129, 0.3)';
+      tCtx.setLineDash([4, 4]);
+      tCtx.beginPath();
+      tCtx.moveTo(0, targetMaxY);
+      tCtx.lineTo(w, targetMaxY);
+      tCtx.moveTo(0, targetMinY);
+      tCtx.lineTo(w, targetMinY);
+      tCtx.stroke();
+      tCtx.setLineDash([]);
+
+      // 90° Neutral Center Line
+      const neutralY = h - Math.max(0, Math.min(1, (90 - 50) / 80)) * (h - 28) - 14;
+      tCtx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
+      tCtx.beginPath();
+      tCtx.moveTo(0, neutralY);
+      tCtx.lineTo(w, neutralY);
+      tCtx.stroke();
+
+      tCtx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+      tCtx.font = '9px JetBrains Mono, monospace';
+      tCtx.fillText('90° NEUTRAL', 8, neutralY - 3);
+      tCtx.fillText('TARGET ARC: 60°-120°', w - 130, targetMaxY + 10);
+
+      if (AppState.streamingActive) {
+        telemetryHistory.push({
+          arc: AppState.telemetry.movementArc,
+          speed: AppState.telemetry.movementSpeed,
+          angularSpeed: AppState.telemetry.angularSpeed
+        });
+
+        if (telemetryHistory.length > maxDataPoints) {
+          telemetryHistory.shift();
+        }
+      }
+
+      const step = w / (maxDataPoints - 1);
+
+      function plotWaveform(key, strokeColor, scaleMin, scaleMax, lineWidth = 2) {
+        tCtx.beginPath();
+        tCtx.strokeStyle = strokeColor;
+        tCtx.lineWidth = lineWidth;
+        tCtx.shadowColor = strokeColor;
+        tCtx.shadowBlur = 6;
+
+        for (let i = 0; i < telemetryHistory.length; i++) {
+          const val = telemetryHistory[i][key];
+          const norm = Math.max(0, Math.min(1, (val - scaleMin) / (scaleMax - scaleMin)));
+          const y = h - norm * (h - 28) - 14;
+          const x = i * step;
+          if (i === 0) {
+            tCtx.moveTo(x, y);
+          } else {
+            tCtx.lineTo(x, y);
+          }
+        }
+        tCtx.stroke();
+        tCtx.shadowBlur = 0;
+      }
+
+      // Plot: Tracked Movement Arc (Cyan), Movement Speed (Blue), Angular Speed (Violet)
+      plotWaveform('arc', '#06b6d4', 50, 130, 2.5);
+      plotWaveform('speed', '#3b82f6', 0, 1.5, 2);
+      plotWaveform('angularSpeed', '#8b5cf6', 0, 80, 2);
+    }
+
+    function updateDashboardKPIs() {
+      const t = AppState.telemetry;
+
+      // Doctor Dashboard Gauges
+      const mArc = document.getElementById('docMetricArc');
+      const mSpeed = document.getElementById('docMetricSpeed');
+      const mAngularSpeed = document.getElementById('docMetricAngularSpeed');
+      const mSmoothness = document.getElementById('docMetricSmoothness');
+      const mSwings = document.getElementById('docMetricSwings');
+      const mAccuracy = document.getElementById('docMetricAccuracy');
+      const mArcStatus = document.getElementById('docArcStatus');
+
+      const barArc = document.getElementById('docBarArc');
+      const barSpeed = document.getElementById('docBarSpeed');
+      const barAngularSpeed = document.getElementById('docBarAngularSpeed');
+      const barSmoothness = document.getElementById('docBarSmoothness');
+      const barSwings = document.getElementById('docBarSwings');
+      const barAccuracy = document.getElementById('docBarAccuracy');
+
+      if (mArc) mArc.innerText = `${t.movementArc.toFixed(1)}°`;
+      if (mSpeed) mSpeed.innerHTML = `${t.movementSpeed.toFixed(2)} <span class="text-sm font-normal text-slate-500">m/s</span>`;
+      if (mAngularSpeed) mAngularSpeed.innerHTML = `${t.angularSpeed.toFixed(1)} <span class="text-sm font-normal text-slate-500">°/s</span>`;
+      if (mSmoothness) mSmoothness.innerText = `${t.movementSmoothness.toFixed(2)}`;
+      if (mSwings) mSwings.innerText = `${t.swingCount}`;
+      if (mAccuracy) mAccuracy.innerText = `${t.hitAccuracy.toFixed(1)}%`;
+
+      const swingsPct = Math.min(100, Math.round((t.swingCount / t.targetSwings) * 100));
+      const swingsPctEl = document.getElementById('docSwingsPct');
+      if (swingsPctEl) swingsPctEl.innerText = `${swingsPct}%`;
+
+      const arcPct = Math.min(100, Math.max(0, ((t.movementArc - 55) / 70) * 100));
+      if (barArc) barArc.style.width = `${arcPct}%`;
+      if (barSpeed) barSpeed.style.width = `${Math.min(100, (t.movementSpeed / 1.5) * 100)}%`;
+      if (barAngularSpeed) barAngularSpeed.style.width = `${Math.min(100, (t.angularSpeed / 70) * 100)}%`;
+      if (barSmoothness) barSmoothness.style.width = `${t.movementSmoothness * 100}%`;
+      if (barSwings) barSwings.style.width = `${swingsPct}%`;
+      if (barAccuracy) barAccuracy.style.width = `${t.hitAccuracy}%`;
+
+      // Update Doctor Live Controller Arc Bar & Pin Indicator
+      const docLiveArcBadge = document.getElementById('docLiveArcBadge');
+      const docLiveZoneLabel = document.getElementById('docLiveZoneLabel');
+      const docLiveArcBar = document.getElementById('docLiveArcBar');
+      const docLiveArcPin = document.getElementById('docLiveArcPin');
+
+      if (docLiveArcBadge) docLiveArcBadge.innerText = `${t.movementArc.toFixed(1)}°`;
+      if (docLiveArcBar) docLiveArcBar.style.width = `${arcPct}%`;
+      if (docLiveArcPin) docLiveArcPin.style.left = `calc(${arcPct}% - 8px)`;
+
+      if (docLiveZoneLabel) {
+        if (t.movementArc > 95) {
+          docLiveZoneLabel.innerText = 'Right Abduction';
+          docLiveZoneLabel.className = 'text-cyan-600 dark:text-cyan-400 font-bold';
+        } else if (t.movementArc < 85) {
+          docLiveZoneLabel.innerText = 'Left Adduction';
+          docLiveZoneLabel.className = 'text-violet-600 dark:text-violet-400 font-bold';
+        } else {
+          docLiveZoneLabel.innerText = 'Neutral (Center)';
+          docLiveZoneLabel.className = 'text-emerald-600 dark:text-emerald-400 font-bold';
+        }
+      }
+
+      if (mArcStatus) {
+        if (t.movementArc > 95) {
+          mArcStatus.innerText = 'Right Abduction';
+          mArcStatus.className = 'text-cyan-600 dark:text-cyan-400 font-semibold';
+        } else if (t.movementArc < 85) {
+          mArcStatus.innerText = 'Left Adduction';
+          mArcStatus.className = 'text-violet-600 dark:text-violet-400 font-semibold';
+        } else {
+          mArcStatus.innerText = 'Neutral (90°)';
+          mArcStatus.className = 'text-emerald-600 dark:text-emerald-400 font-bold';
+        }
+      }
+
+      // Secondary KPI Rows
+      const valHits = document.getElementById('docValHits');
+      const valMisses = document.getElementById('docValMisses');
+      const valCurStreak = document.getElementById('docValCurrentStreak');
+      const valBestStreak = document.getElementById('docValBestStreak');
+      const valFH = document.getElementById('docValForehand');
+      const valBH = document.getElementById('docValBackhand');
+      const valReact = document.getElementById('docValReactionTime');
+      const barFH = document.getElementById('docBarForehand');
+      const barBH = document.getElementById('docBarBackhand');
+
+      if (valHits) valHits.innerText = t.successfulHits;
+      if (valMisses) valMisses.innerText = t.missedBalls;
+      if (valCurStreak) valCurStreak.innerText = `${t.currentStreak} 🔥`;
+      if (valBestStreak) valBestStreak.innerText = t.bestStreak;
+      if (valFH) valFH.innerText = `FH: ${t.forehandCount}`;
+      if (valBH) valBH.innerText = `BH: ${t.backhandCount}`;
+      if (valReact) valReact.innerHTML = `${t.reactionTimeMs} <span class="text-xs font-normal text-slate-500">ms</span>`;
+
+      const totalDirectionSwings = t.forehandCount + t.backhandCount;
+      if (totalDirectionSwings > 0) {
+        const fhPct = Math.round((t.forehandCount / totalDirectionSwings) * 100);
+        if (barFH) barFH.style.width = `${fhPct}%`;
+        if (barBH) barBH.style.width = `${100 - fhPct}%`;
+      }
+
+      // Patient Portal HUD Updates
+      const gArc = document.getElementById('gameHudArc');
+      const gSpeed = document.getElementById('gameHudSpeed');
+      const gSwings = document.getElementById('gameHudSwings');
+      const gSwingsPct = document.getElementById('gameHudSwingsPct');
+      const gAccuracy = document.getElementById('gameHudAccuracy');
+      const gHits = document.getElementById('gameHudHits');
+      const gStreak = document.getElementById('gameHudStreak');
+      const pCoachSwings = document.getElementById('patientCoachSwings');
+
+      if (gArc) gArc.innerText = `${t.movementArc.toFixed(1)}°`;
+      if (gSpeed) gSpeed.innerText = `${t.movementSpeed.toFixed(2)} m/s`;
+      if (gSwings) gSwings.innerText = `${t.swingCount}`;
+      if (gSwingsPct) gSwingsPct.innerText = `${swingsPct}%`;
+      if (gAccuracy) gAccuracy.innerText = `${t.hitAccuracy.toFixed(1)}%`;
+      if (gHits) gHits.innerText = t.successfulHits;
+      if (gStreak) gStreak.innerText = t.currentStreak;
+      if (pCoachSwings) pCoachSwings.innerText = `${t.swingCount} / ${t.targetSwings}`;
+    }
+
+    const gameCanvas = document.getElementById('gameCanvas');
+    const gCtx = gameCanvas ? gameCanvas.getContext('2d') : null;
+    let currentGameMode = 'pong';
+    let gameRunning = false;
+    let gamePaused = false;
+    let ballSpeedModifier = 1.0;
+    let lastBroadcastTime = 0;
+
+    const VisualFX = {
+      particles: [],
+      ripples: [],
+      screenShake: 0,
+      ballTrail: [],
+      stars: [],
+      riverFlow: 0,
+      
+      init() {
+        this.stars = [];
+        for (let i = 0; i < 48; i++) {
+          this.stars.push({
+            x: Math.random(),
+            y: Math.random(),
+            size: 0.8 + Math.random() * 1.8,
+            speed: 0.15 + Math.random() * 0.45,
+            alpha: 0.2 + Math.random() * 0.7,
+            twinkle: Math.random() * Math.PI * 2
+          });
+        }
+      },
+
+      addSparks(x, y, color = '#06b6d4', count = 12, speedMult = 1.0) {
+        for (let i = 0; i < count; i++) {
+          const angle = Math.random() * Math.PI * 2;
+          const speed = (1.5 + Math.random() * 3.5) * speedMult;
+          this.particles.push({
+            x, y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            life: 1.0,
+            decay: 0.02 + Math.random() * 0.035,
+            size: 2.2 + Math.random() * 2.8,
+            color
+          });
+        }
+      },
+
+      addRipple(x, y, color = 'rgba(6, 182, 212, 0.65)', maxR = 45) {
+        this.ripples.push({
+          x, y,
+          r: 6,
+          maxR,
+          alpha: 0.9,
+          decay: 0.032,
+          color
+        });
+      },
+
+      shakeScreen(intensity = 4) {
+        this.screenShake = Math.max(this.screenShake, intensity);
+      },
+
+      update() {
+        if (this.screenShake > 0.1) {
+          this.screenShake *= 0.85;
+        } else {
+          this.screenShake = 0;
+        }
+
+        this.riverFlow = (this.riverFlow + 1.2 * ballSpeedModifier) % 1000;
+
+        for (let i = this.particles.length - 1; i >= 0; i--) {
+          const p = this.particles[i];
+          p.x += p.vx;
+          p.y += p.vy;
+          p.vx *= 0.95;
+          p.vy *= 0.95;
+          p.life -= p.decay;
+          if (p.life <= 0) {
+            this.particles.splice(i, 1);
+          }
+        }
+
+        for (let i = this.ripples.length - 1; i >= 0; i--) {
+          const r = this.ripples[i];
+          r.r += (r.maxR - r.r) * 0.14;
+          r.alpha -= r.decay;
+          if (r.alpha <= 0) {
+            this.ripples.splice(i, 1);
+          }
+        }
+      },
+
+      drawOverlayFX(ctx) {
+        this.ripples.forEach(r => {
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(r.x, r.y, r.r, 0, Math.PI * 2);
+          ctx.strokeStyle = r.color.replace(/[\d\.]+\)$/g, `${Math.max(0, r.alpha)})`);
+          ctx.lineWidth = 2.5;
+          ctx.shadowColor = r.color;
+          ctx.shadowBlur = 10;
+          ctx.stroke();
+          ctx.restore();
+        });
+
+        this.particles.forEach(p => {
+          ctx.save();
+          ctx.globalAlpha = Math.max(0, p.life);
+          ctx.fillStyle = p.color;
+          ctx.shadowColor = p.color;
+          ctx.shadowBlur = 8;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        });
+      }
+    };
+    VisualFX.init();
+
+    const GameState = {
+      playerPaddle: { x: 0.5, y: 0.88, width: 0.22, height: 0.035, smoothX: 0.5, rollAngle: 0 },
+      aiPaddle: { x: 0.5, y: 0.12, width: 0.2, height: 0.03 },
+      ball: { x: 0.5, y: 0.5, vx: 0.005, vy: 0.007, radius: 0.02 },
+      
+      shield: { meteors: [], plasmaPulse: 0, nextSpawn: 0 },
+      kayak: { lilies: [], nextSpawn: 0, oarPhase: 0 },
+      harp: { strings: [], lastPluckedIndex: -1, vibrations: [0, 0, 0, 0, 0, 0, 0, 0] },
+      fruit: { items: [], nextSpawn: 0 }
+    };
+
+    const harpNotes = [
+      { note: 'C4', freq: 261.63, color: '#06b6d4', glow: 'rgba(6, 182, 212, 0.4)' },
+      { note: 'D4', freq: 293.66, color: '#3b82f6', glow: 'rgba(59, 130, 246, 0.4)' },
+      { note: 'E4', freq: 329.63, color: '#6366f1', glow: 'rgba(99, 102, 241, 0.4)' },
+      { note: 'F4', freq: 349.23, color: '#8b5cf6', glow: 'rgba(139, 92, 246, 0.4)' },
+      { note: 'G4', freq: 392.00, color: '#a855f7', glow: 'rgba(168, 85, 247, 0.4)' },
+      { note: 'A4', freq: 440.00, color: '#ec4899', glow: 'rgba(236, 72, 153, 0.4)' },
+      { note: 'B4', freq: 493.88, color: '#f43f5e', glow: 'rgba(244, 63, 94, 0.4)' },
+      { note: 'C5', freq: 523.25, color: '#10b981', glow: 'rgba(16, 185, 129, 0.4)' }
+    ];
+
+    function resizeGameCanvas() {
+      if (!gameCanvas) return;
+      const rect = gameCanvas.parentElement.getBoundingClientRect();
+      gameCanvas.width = rect.width;
+      gameCanvas.height = rect.height;
+    }
+
+    function selectGame(mode) {
+      currentGameMode = mode;
+      
+      const buttons = {
+        pong: document.getElementById('btnGamePong'),
+        shield: document.getElementById('btnGameShield'),
+        kayak: document.getElementById('btnGameKayak'),
+        harp: document.getElementById('btnGameHarp'),
+        fruit: document.getElementById('btnGameFruit')
+      };
+
+      Object.keys(buttons).forEach(key => {
+        if (buttons[key]) {
+          buttons[key].className = 'px-3 py-1.5 rounded-lg text-slate-600 dark:text-slate-400 hover:text-cyan-600 transition flex items-center gap-1.5';
+        }
+      });
+
+      if (buttons[mode]) {
+        buttons[mode].className = 'px-3 py-1.5 rounded-lg bg-violet-600 text-white font-bold transition shadow-sm flex items-center gap-1.5';
+      }
+
+      const pHeading = document.getElementById('patientPortalHeading');
+      const oTitle = document.getElementById('gameOverlayTitle');
+      const oSubtitle = document.getElementById('gameOverlaySubtitle');
+      const oIcon = document.getElementById('gameOverlayIcon');
+      const scoreLabel = document.getElementById('gameHudScoreLabel');
+
+      if (mode === 'pong') {
+        if (pHeading) pHeading.innerText = 'RehabVR Table Tennis Arc Studio';
+        if (oTitle) oTitle.innerText = 'RehabVR Table Tennis Arc Exercise';
+        if (oSubtitle) oSubtitle.innerText = 'Glide your paddle horizontally along the reverse-U curved trajectory. Return the ball to train horizontal shoulder abduction and wrist stability.';
+        if (oIcon) oIcon.className = 'fa-solid fa-table-tennis-paddle-ball';
+        if (scoreLabel) scoreLabel.innerText = 'HITS';
+      } else if (mode === 'shield') {
+        if (pHeading) pHeading.innerText = 'Horizon Shield Defender Studio';
+        if (oTitle) oTitle.innerText = 'Horizon Shield Defender';
+        if (oSubtitle) oSubtitle.innerText = 'Intercept incoming cosmic plasma spheres across the sky-dome arc. Sweeping the board moves your orbital energy barrier across the full field.';
+        if (oIcon) oIcon.className = 'fa-solid fa-shield-halved';
+        if (scoreLabel) scoreLabel.innerText = 'BLOCKS';
+        GameState.shield.meteors = [];
+      } else if (mode === 'kayak') {
+        if (pHeading) pHeading.innerText = 'River Canyon Kayak Journey';
+        if (oTitle) oTitle.innerText = 'River Canyon Kayak Journey';
+        if (oSubtitle) oSubtitle.innerText = 'Guide your kayak through calm waters. Sweep smoothly from bank to bank to collect floating water lilies and glowing lanterns.';
+        if (oIcon) oIcon.className = 'fa-solid fa-water';
+        if (scoreLabel) scoreLabel.innerText = 'LILIES';
+        GameState.kayak.lilies = [];
+      } else if (mode === 'harp') {
+        if (pHeading) pHeading.innerText = 'Celestial Laser Harp Harmony';
+        if (oTitle) oTitle.innerText = 'Celestial Laser Harp Harmony';
+        if (oSubtitle) oSubtitle.innerText = 'Sweep the carriage across 8 luminescent laser strings. Each plucked string generates synthesized harmonic frequencies to train rhythmic cadence.';
+        if (oIcon) oIcon.className = 'fa-solid fa-music';
+        if (scoreLabel) scoreLabel.innerText = 'CHIMES';
+      } else if (mode === 'fruit') {
+        if (pHeading) pHeading.innerText = 'Cosmic Fruit Catcher Studio';
+        if (oTitle) oTitle.innerText = 'Cosmic Fruit Catcher';
+        if (oSubtitle) oSubtitle.innerText = 'Glide your celestial basket along the curved arc. Catch star-fruits drifting from orbit to practice motor precision and smooth tracking.';
+        if (oIcon) oIcon.className = 'fa-solid fa-apple-whole';
+        if (scoreLabel) scoreLabel.innerText = 'FRUITS';
+        GameState.fruit.items = [];
+      }
+
+      const overlay = document.getElementById('gameStartOverlay');
+      if (overlay) overlay.style.display = 'flex';
+      gameRunning = false;
+      gamePaused = false;
+    }
+
+    function startGameSimulation() {
+      const overlay = document.getElementById('gameStartOverlay');
+      if (overlay) overlay.style.display = 'none';
+      gameRunning = true;
+      gamePaused = false;
+      const pauseText = document.getElementById('gamePauseText');
+      const pauseIcon = document.getElementById('gamePauseIcon');
+      if (pauseText) pauseText.innerText = 'Pause';
+      if (pauseIcon) pauseIcon.className = 'fa-solid fa-pause text-cyan-500';
+
+      if (currentGameMode === 'pong') {
+        resetBall();
+      }
+      playTone(520, 'sine', 0.2);
+    }
+
+    function toggleGamePause() {
+      if (!gameRunning) {
+        startGameSimulation();
+        return;
+      }
+
+      gamePaused = !gamePaused;
+      const pauseOverlay = document.getElementById('gamePauseOverlay');
+      const pauseText = document.getElementById('gamePauseText');
+      const pauseIcon = document.getElementById('gamePauseIcon');
+
+      if (gamePaused) {
+        if (pauseOverlay) {
+          pauseOverlay.classList.remove('hidden');
+          pauseOverlay.classList.add('flex');
+        }
+        if (pauseText) pauseText.innerText = 'Resume';
+        if (pauseIcon) pauseIcon.className = 'fa-solid fa-play text-emerald-500';
+      } else {
+        if (pauseOverlay) {
+          pauseOverlay.classList.remove('flex');
+          pauseOverlay.classList.add('hidden');
+        }
+        if (pauseText) pauseText.innerText = 'Pause';
+        if (pauseIcon) pauseIcon.className = 'fa-solid fa-pause text-cyan-500';
+      }
+    }
+
+    function stopGameSession() {
+      gameRunning = false;
+      gamePaused = false;
+      const overlay = document.getElementById('gameStartOverlay');
+      const pauseOverlay = document.getElementById('gamePauseOverlay');
+      const title = document.getElementById('gameOverlayTitle');
+      const subtitle = document.getElementById('gameOverlaySubtitle');
+      const btnText = document.getElementById('gameStartBtnText');
+
+      if (pauseOverlay) {
+        pauseOverlay.classList.remove('flex');
+        pauseOverlay.classList.add('hidden');
+      }
+      if (title) title.innerText = 'Session Standby / Completed';
+      if (subtitle) subtitle.innerText = `Current Progress: ${AppState.telemetry.swingCount} of ${AppState.telemetry.targetSwings} swings saved. Accuracy: ${AppState.telemetry.hitAccuracy}%.`;
+      if (btnText) btnText.innerText = 'Resume Session';
+      if (overlay) overlay.style.display = 'flex';
+
+      playTone(380, 'sine', 0.15);
+    }
+
+    function resetBall() {
+      GameState.ball.x = 0.5;
+      GameState.ball.y = 0.42;
+      const speed = 0.007 * ballSpeedModifier;
+      GameState.ball.vx = (Math.random() > 0.5 ? 1 : -1) * (0.0035 + Math.random() * 0.002);
+      GameState.ball.vy = speed;
+      VisualFX.ballTrail = [];
+    }
+
+    if (gameCanvas) {
+      const updatePaddlePosFromEvent = (e) => {
+        const rect = gameCanvas.getBoundingClientRect();
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        let normX = (clientX - rect.left) / rect.width;
+        normX = Math.max(0.05, Math.min(0.95, normX));
+        setPaddleNormalizedX(normX);
+      };
+
+      gameCanvas.addEventListener('mousemove', updatePaddlePosFromEvent);
+      gameCanvas.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        updatePaddlePosFromEvent(e);
+      }, { passive: false });
+    }
+
+    function handleArcSliderChange(val) {
+      const normX = parseFloat(val) / 100;
+      setPaddleNormalizedX(normX);
+    }
+
+    function setPaddleNormalizedX(normX) {
+      // Check if real Unity VR headset is actively streaming
+      const isVRStreaming = window.FirebaseBridge && window.FirebaseBridge.lastPacketReceivedMs && (Date.now() - window.FirebaseBridge.lastPacketReceivedMs < 5000);
+
+      const prevX = GameState.playerPaddle.x;
+      GameState.playerPaddle.x = normX;
+      
+      const arcSlider = document.getElementById('arcBoardSlider');
+      if (arcSlider) arcSlider.value = Math.round(normX * 100);
+
+      const uShape = 1.0 - Math.pow((normX - 0.5) * 2.1, 2);
+      GameState.playerPaddle.y = 0.90 - Math.max(0, uShape) * 0.08;
+
+      const deltaMove = normX - prevX;
+      GameState.playerPaddle.rollAngle = GameState.playerPaddle.rollAngle * 0.7 + deltaMove * 8.0;
+
+      // If VR headset is actively streaming, DO NOT overwrite real telemetry with local mouse/slider sweep
+      if (isVRStreaming) {
+        return;
+      }
+
+      // Tracked Movement Arc: 55° (Adduction) -> 90° (Neutral) -> 125° (Abduction)
+      const calculatedArc = 90.0 + (normX - 0.5) * 70.0;
+
+      const now = Date.now();
+      const dt = (now - AppState.telemetry.lastArcTimestamp) / 1000;
+      if (dt > 0.015) {
+        const dAngle = Math.abs(calculatedArc - AppState.telemetry.lastArcVal);
+        const instantAngSpeed = dAngle / dt;
+        AppState.telemetry.angularSpeed = AppState.telemetry.angularSpeed * 0.65 + instantAngSpeed * 0.35;
+        
+        const instantLinSpeed = (Math.abs(deltaMove) * 1.8) / dt;
+        AppState.telemetry.movementSpeed = AppState.telemetry.movementSpeed * 0.65 + instantLinSpeed * 0.35;
+
+        AppState.telemetry.lastArcTimestamp = now;
+        AppState.telemetry.lastArcVal = calculatedArc;
+      }
+
+      AppState.telemetry.movementArc = calculatedArc;
+
+      if (Math.abs(deltaMove) > 0.02) {
+        if (calculatedArc >= 90) {
+          AppState.telemetry.forehandCount = Math.min(AppState.telemetry.swingCount, AppState.telemetry.forehandCount + 0.01);
+        } else {
+          AppState.telemetry.backhandCount = Math.min(AppState.telemetry.swingCount, AppState.telemetry.backhandCount + 0.01);
+        }
+      }
+
+      updateDashboardKPIs();
+
+      if (currentGameMode === 'harp' && gameRunning && !gamePaused) {
+        const harpIndex = Math.min(7, Math.max(0, Math.floor(normX * 8)));
+        if (harpIndex !== GameState.harp.lastPluckedIndex) {
+          GameState.harp.lastPluckedIndex = harpIndex;
+          GameState.harp.vibrations[harpIndex] = 16;
+          playTone(harpNotes[harpIndex].freq, 'triangle', 0.28, 0.25);
+          
+          if (gameCanvas) {
+            const stepX = (gameCanvas.width * 0.8) / 7;
+            const px = gameCanvas.width * 0.1 + harpIndex * stepX;
+            const py = GameState.playerPaddle.y * gameCanvas.height;
+            VisualFX.addSparks(px, py, harpNotes[harpIndex].color, 16, 1.4);
+            VisualFX.addRipple(px, py, harpNotes[harpIndex].color, 55);
+          }
+
+          recordSuccessfulHit();
+        }
+      }
+
+      if (now - lastBroadcastTime > 200) {
+        lastBroadcastTime = now;
+        broadcastSyncPayload({
+          type: 'TELEMETRY_SYNC',
+          telemetry: {
+            movementArc: AppState.telemetry.movementArc,
+            movementSpeed: AppState.telemetry.movementSpeed,
+            angularSpeed: AppState.telemetry.angularSpeed,
+            movementSmoothness: AppState.telemetry.movementSmoothness,
+            swingCount: AppState.telemetry.swingCount,
+            successfulHits: AppState.telemetry.successfulHits,
+            missedBalls: AppState.telemetry.missedBalls,
+            hitAccuracy: AppState.telemetry.hitAccuracy,
+            currentStreak: AppState.telemetry.currentStreak,
+            bestStreak: AppState.telemetry.bestStreak,
+            forehandCount: Math.round(AppState.telemetry.forehandCount),
+            backhandCount: Math.round(AppState.telemetry.backhandCount)
+          }
+        });
+      }
+    }
+
+    function recordSuccessfulHit() {
+      // When VR headset is active, do not let local mini-game overwrite remote VR stats
+      if (window.FirebaseBridge && window.FirebaseBridge.lastPacketReceivedMs && (Date.now() - window.FirebaseBridge.lastPacketReceivedMs < 5000)) {
+        return;
+      }
+
+      AppState.telemetry.successfulHits++;
+      AppState.telemetry.currentStreak++;
+      if (AppState.telemetry.currentStreak > AppState.telemetry.bestStreak) {
+        AppState.telemetry.bestStreak = AppState.telemetry.currentStreak;
+      }
+      
+      const totalAttempts = AppState.telemetry.successfulHits + AppState.telemetry.missedBalls;
+      AppState.telemetry.hitAccuracy = Math.round((AppState.telemetry.successfulHits / totalAttempts) * 1000) / 10;
+      
+      AppState.telemetry.swingCount = Math.min(AppState.telemetry.targetSwings, AppState.telemetry.swingCount + 1);
+      
+      if (AppState.telemetry.movementArc >= 90) {
+        AppState.telemetry.forehandCount++;
+      } else {
+        AppState.telemetry.backhandCount++;
+      }
+
+      updateDashboardKPIs();
+    }
+
+    function recordMissedBall() {
+      // When VR headset is active, do not let local mini-game overwrite remote VR stats
+      if (window.FirebaseBridge && window.FirebaseBridge.lastPacketReceivedMs && (Date.now() - window.FirebaseBridge.lastPacketReceivedMs < 5000)) {
+        return;
+      }
+
+      AppState.telemetry.missedBalls++;
+      AppState.telemetry.currentStreak = 0;
+      
+      const totalAttempts = AppState.telemetry.successfulHits + AppState.telemetry.missedBalls;
+      AppState.telemetry.hitAccuracy = Math.round((AppState.telemetry.successfulHits / totalAttempts) * 1000) / 10;
+      
+      updateDashboardKPIs();
+    }
+
+    function updateGamePhysics() {
+      if (!gameRunning || gamePaused) return;
+
+      const player = GameState.playerPaddle;
+      const w = gameCanvas ? gameCanvas.width : 800;
+      const h = gameCanvas ? gameCanvas.height : 450;
+
+      VisualFX.update();
+
+      if (currentGameMode === 'pong') {
+        const ball = GameState.ball;
+        const ai = GameState.aiPaddle;
+
+        VisualFX.ballTrail.push({ x: ball.x, y: ball.y });
+        if (VisualFX.ballTrail.length > 8) VisualFX.ballTrail.shift();
+
+        ball.x += ball.vx * ballSpeedModifier;
+        ball.y += ball.vy * ballSpeedModifier;
+
+        if (ball.x - ball.radius <= 0.02) {
+          ball.x = 0.02 + ball.radius;
+          ball.vx = -ball.vx;
+          playTone(340, 'square', 0.06, 0.1);
+          VisualFX.addSparks(w * 0.03, ball.y * h, '#38bdf8', 8);
+          VisualFX.shakeScreen(2.5);
+        } else if (ball.x + ball.radius >= 0.98) {
+          ball.x = 0.98 - ball.radius;
+          ball.vx = -ball.vx;
+          playTone(340, 'square', 0.06, 0.1);
+          VisualFX.addSparks(w * 0.97, ball.y * h, '#38bdf8', 8);
+          VisualFX.shakeScreen(2.5);
+        }
+
+        ai.x += (ball.x - ai.x) * 0.075;
+
+        const playerTop = player.y - player.height / 2;
+        const playerBottom = player.y + player.height / 2;
+        const playerLeft = player.x - player.width / 2;
+        const playerRight = player.x + player.width / 2;
+
+        if (
+          ball.y + ball.radius >= playerTop &&
+          ball.y - ball.radius <= playerBottom &&
+          ball.x >= playerLeft &&
+          ball.x <= playerRight &&
+          ball.vy > 0
+        ) {
+          ball.vy = -Math.abs(ball.vy) * 1.025;
+          const hitOffset = (ball.x - player.x) / (player.width / 2);
+          ball.vx += hitOffset * 0.004;
+
+          recordSuccessfulHit();
+          playPaddleHitSound();
+          triggerHapticVisualFeedback();
+          triggerHapticPulse('pong_paddle_return');
+
+          VisualFX.addSparks(ball.x * w, playerTop * h, '#06b6d4', 20, 1.3);
+          VisualFX.addRipple(ball.x * w, playerTop * h, 'rgba(6, 182, 212, 0.8)', 60);
+          VisualFX.shakeScreen(5);
+        }
+
+        const aiTop = ai.y - ai.height / 2;
+        const aiBottom = ai.y + ai.height / 2;
+        const aiLeft = ai.x - ai.width / 2;
+        const aiRight = ai.x + ai.width / 2;
+
+        if (
+          ball.y - ball.radius <= aiBottom &&
+          ball.y + ball.radius >= aiTop &&
+          ball.x >= aiLeft &&
+          ball.x <= aiRight &&
+          ball.vy < 0
+        ) {
+          ball.vy = Math.abs(ball.vy);
+          playPaddleHitSound();
+          VisualFX.addSparks(ball.x * w, aiBottom * h, '#a855f7', 12);
+        }
+
+        if (ball.y > 1.05) {
+          recordMissedBall();
+          playTone(180, 'sawtooth', 0.25, 0.2);
+          VisualFX.shakeScreen(4);
+          resetBall();
+        }
+
+        if (ball.y < -0.05) {
+          playScoreSound();
+          VisualFX.addSparks(ball.x * w, h * 0.05, '#10b981', 25, 1.5);
+          resetBall();
+        }
+
+      } else if (currentGameMode === 'shield') {
+        const shieldState = GameState.shield;
+        shieldState.plasmaPulse = (shieldState.plasmaPulse + 0.08) % (Math.PI * 2);
+        shieldState.nextSpawn--;
+        if (shieldState.nextSpawn <= 0) {
+          shieldState.meteors.push({
+            x: 0.12 + Math.random() * 0.76,
+            y: 0.03,
+            speed: (0.0038 + Math.random() * 0.0028) * ballSpeedModifier,
+            radius: 13,
+            hue: Math.random() > 0.4 ? '#f43f5e' : '#fb923c'
+          });
+          shieldState.nextSpawn = Math.floor(40 / ballSpeedModifier);
+        }
+
+        for (let i = shieldState.meteors.length - 1; i >= 0; i--) {
+          const m = shieldState.meteors[i];
+          m.y += m.speed;
+
+          const dx = m.x - player.x;
+          const dy = m.y - player.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+
+          if (dist < 0.12 && m.y <= player.y + 0.04) {
+            const hitX = m.x * w;
+            const hitY = m.y * h;
+            shieldState.meteors.splice(i, 1);
+            recordSuccessfulHit();
+            playPaddleHitSound();
+            triggerHapticVisualFeedback();
+            triggerHapticPulse('shield_intercept');
+
+            VisualFX.addSparks(hitX, hitY, '#06b6d4', 24, 1.8);
+            VisualFX.addRipple(hitX, hitY, 'rgba(6, 182, 212, 0.9)', 70);
+            VisualFX.shakeScreen(6);
+            continue;
+          }
+
+          if (m.y > 1.02) {
+            shieldState.meteors.splice(i, 1);
+            recordMissedBall();
+          }
+        }
+
+      } else if (currentGameMode === 'kayak') {
+        const kayakState = GameState.kayak;
+        kayakState.oarPhase += 0.12 * ballSpeedModifier;
+        kayakState.nextSpawn--;
+        if (kayakState.nextSpawn <= 0) {
+          kayakState.lilies.push({
+            x: 0.15 + Math.random() * 0.7,
+            y: -0.05,
+            speed: (0.003 + Math.random() * 0.002) * ballSpeedModifier,
+            isLantern: Math.random() > 0.65,
+            rotation: Math.random() * Math.PI * 2
+          });
+          kayakState.nextSpawn = Math.floor(40 / ballSpeedModifier);
+        }
+
+        for (let i = kayakState.lilies.length - 1; i >= 0; i--) {
+          const item = kayakState.lilies[i];
+          item.y += item.speed;
+
+          const dx = item.x - player.x;
+          const dy = item.y - player.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+
+          if (dist < 0.08) {
+            const hitX = item.x * w;
+            const hitY = item.y * h;
+            kayakState.lilies.splice(i, 1);
+            recordSuccessfulHit();
+            playScoreSound();
+            triggerHapticVisualFeedback();
+            triggerHapticPulse('kayak_collect');
+
+            VisualFX.addSparks(hitX, hitY, item.isLantern ? '#fbbf24' : '#34d399', 18, 1.2);
+            VisualFX.addRipple(hitX, hitY, 'rgba(52, 211, 153, 0.8)', 50);
+            continue;
+          }
+
+          if (item.y > 1.05) {
+            kayakState.lilies.splice(i, 1);
+          }
+        }
+
+      } else if (currentGameMode === 'harp') {
+        // Laser harp physics are handled on horizontal motion swipe
+      } else if (currentGameMode === 'fruit') {
+        const fruitState = GameState.fruit;
+        fruitState.nextSpawn--;
+        if (fruitState.nextSpawn <= 0) {
+          fruitState.items.push({
+            x: 0.12 + Math.random() * 0.76,
+            y: -0.05,
+            speed: (0.0035 + Math.random() * 0.0025) * ballSpeedModifier,
+            kind: Math.floor(Math.random() * 3),
+            rot: Math.random() * Math.PI * 2
+          });
+          fruitState.nextSpawn = Math.floor(45 / ballSpeedModifier);
+        }
+
+        for (let i = fruitState.items.length - 1; i >= 0; i--) {
+          const f = fruitState.items[i];
+          f.y += f.speed;
+          f.rot += 0.03;
+
+          const dx = f.x - player.x;
+          const dy = f.y - player.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+
+          if (dist < 0.09) {
+            const hitX = f.x * w;
+            const hitY = f.y * h;
+            fruitState.items.splice(i, 1);
+            recordSuccessfulHit();
+            playScoreSound();
+            triggerHapticVisualFeedback();
+            triggerHapticPulse('fruit_caught');
+
+            const fruitColors = ['#f43f5e', '#fde047', '#10b981'];
+            VisualFX.addSparks(hitX, hitY, fruitColors[f.kind], 22, 1.4);
+            VisualFX.addRipple(hitX, hitY, fruitColors[f.kind], 60);
+            continue;
+          }
+
+          if (f.y > 1.05) {
+            fruitState.items.splice(i, 1);
+            recordMissedBall();
+          }
+        }
+      }
+    }
+
+    function drawGameCanvas() {
+      if (!gCtx || !gameCanvas) return;
+      const w = gameCanvas.width;
+      const h = gameCanvas.height;
+
+      gCtx.save();
+
+      // Screen micro-shake
+      if (VisualFX.screenShake > 0.1) {
+        const shakeX = (Math.random() - 0.5) * VisualFX.screenShake;
+        const shakeY = (Math.random() - 0.5) * VisualFX.screenShake;
+        gCtx.translate(shakeX, shakeY);
+      }
+
+      const p = GameState.playerPaddle;
+
+      if (currentGameMode === 'pong') {
+        // Perspective Court Floor
+        const courtGrad = gCtx.createLinearGradient(0, 0, 0, h);
+        courtGrad.addColorStop(0, '#090d16');
+        courtGrad.addColorStop(1, '#020617');
+        gCtx.fillStyle = courtGrad;
+        gCtx.fillRect(0, 0, w, h);
+
+        // Grid lines
+        gCtx.strokeStyle = 'rgba(6, 182, 212, 0.08)';
+        gCtx.lineWidth = 1;
+        for (let i = 0.1; i < 1; i += 0.1) {
+          gCtx.beginPath();
+          gCtx.moveTo(w * i, 0);
+          gCtx.lineTo(w * (0.5 + (i - 0.5) * 1.5), h);
+          gCtx.stroke();
+        }
+
+        // Parabolic reverse-U guide path
+        gCtx.strokeStyle = 'rgba(6, 182, 212, 0.25)';
+        gCtx.setLineDash([5, 5]);
+        gCtx.lineWidth = 2;
+        gCtx.beginPath();
+        for (let nx = 0.05; nx <= 0.95; nx += 0.02) {
+          const uY = 0.90 - Math.max(0, 1.0 - Math.pow((nx - 0.5) * 2.1, 2)) * 0.08;
+          if (nx === 0.05) gCtx.moveTo(nx * w, uY * h);
+          else gCtx.lineTo(nx * w, uY * h);
+        }
+        gCtx.stroke();
+        gCtx.setLineDash([]);
+
+        // AI Paddle
+        const ai = GameState.aiPaddle;
+        gCtx.fillStyle = '#a855f7';
+        gCtx.shadowColor = '#c084fc';
+        gCtx.shadowBlur = 12;
+        gCtx.fillRect((ai.x - ai.width / 2) * w, (ai.y - ai.height / 2) * h, ai.width * w, ai.height * h);
+        gCtx.shadowBlur = 0;
+
+        // Ball trail
+        VisualFX.ballTrail.forEach((t, i) => {
+          gCtx.fillStyle = `rgba(6, 182, 212, ${((i + 1) / VisualFX.ballTrail.length) * 0.35})`;
+          gCtx.beginPath();
+          gCtx.arc(t.x * w, t.y * h, GameState.ball.radius * w * 0.8, 0, Math.PI * 2);
+          gCtx.fill();
+        });
+
+        // Pong Ball
+        const ball = GameState.ball;
+        gCtx.fillStyle = '#ffffff';
+        gCtx.shadowColor = '#38bdf8';
+        gCtx.shadowBlur = 16;
+        gCtx.beginPath();
+        gCtx.arc(ball.x * w, ball.y * h, ball.radius * w, 0, Math.PI * 2);
+        gCtx.fill();
+        gCtx.shadowBlur = 0;
+
+        // Player Metallic Paddle
+        gCtx.save();
+        gCtx.translate(p.x * w, p.y * h);
+        gCtx.rotate(p.rollAngle * 0.08);
+
+        const paddleGrad = gCtx.createLinearGradient(-p.width * w * 0.5, 0, p.width * w * 0.5, 0);
+        paddleGrad.addColorStop(0, '#06b6d4');
+        paddleGrad.addColorStop(0.5, '#38bdf8');
+        paddleGrad.addColorStop(1, '#2563eb');
+
+        gCtx.fillStyle = paddleGrad;
+        gCtx.shadowColor = '#06b6d4';
+        gCtx.shadowBlur = 16;
+        gCtx.fillRect(-p.width * w * 0.5, -p.height * h * 0.5, p.width * w, p.height * h);
+        gCtx.restore();
+
+      } else if (currentGameMode === 'shield') {
+        // Starry Sky
+        gCtx.fillStyle = '#030712';
+        gCtx.fillRect(0, 0, w, h);
+
+        VisualFX.stars.forEach(s => {
+          gCtx.fillStyle = `rgba(255, 255, 255, ${s.alpha})`;
+          gCtx.fillRect(s.x * w, s.y * h, s.size, s.size);
+        });
+
+        // Meteors
+        GameState.shield.meteors.forEach(m => {
+          gCtx.fillStyle = m.hue;
+          gCtx.shadowColor = m.hue;
+          gCtx.shadowBlur = 14;
+          gCtx.beginPath();
+          gCtx.arc(m.x * w, m.y * h, m.radius, 0, Math.PI * 2);
+          gCtx.fill();
+          gCtx.shadowBlur = 0;
+        });
+
+        // Forcefield Shield
+        const sx = p.x * w;
+        const sy = p.y * h;
+        gCtx.strokeStyle = '#06b6d4';
+        gCtx.shadowColor = '#38bdf8';
+        gCtx.shadowBlur = 18;
+        gCtx.lineWidth = 6;
+        gCtx.beginPath();
+        gCtx.arc(sx, sy, 45, Math.PI * 1.1, Math.PI * 1.9);
+        gCtx.stroke();
+        gCtx.shadowBlur = 0;
+
+      } else if (currentGameMode === 'kayak') {
+        // River Water
+        const waterGrad = gCtx.createLinearGradient(0, 0, 0, h);
+        waterGrad.addColorStop(0, '#064e3b');
+        waterGrad.addColorStop(1, '#022c22');
+        gCtx.fillStyle = waterGrad;
+        gCtx.fillRect(0, 0, w, h);
+
+        // Water Lilies
+        GameState.kayak.lilies.forEach(l => {
+          const lx = l.x * w;
+          const ly = l.y * h;
+          if (l.isLantern) {
+            gCtx.fillStyle = '#fbbf24';
+            gCtx.shadowColor = '#f59e0b';
+            gCtx.shadowBlur = 16;
+            gCtx.beginPath();
+            gCtx.arc(lx, ly, 10, 0, Math.PI * 2);
+            gCtx.fill();
+            gCtx.shadowBlur = 0;
+          } else {
+            gCtx.fillStyle = '#10b981';
+            gCtx.beginPath();
+            gCtx.arc(lx, ly, 12, 0, Math.PI * 1.7);
+            gCtx.fill();
+          }
+        });
+
+        // Kayak Boat
+        const kx = p.x * w;
+        const ky = p.y * h;
+        gCtx.fillStyle = '#ea580c';
+        gCtx.shadowColor = '#f97316';
+        gCtx.shadowBlur = 12;
+        gCtx.beginPath();
+        gCtx.ellipse(kx, ky, 14, 40, 0, 0, Math.PI * 2);
+        gCtx.fill();
+        gCtx.shadowBlur = 0;
+
+      } else if (currentGameMode === 'harp') {
+        const harpGrad = gCtx.createRadialGradient(w * 0.5, h * 0.4, 60, w * 0.5, h * 0.5, w * 0.85);
+        harpGrad.addColorStop(0, '#180d2b');
+        harpGrad.addColorStop(1, '#05020a');
+        gCtx.fillStyle = harpGrad;
+        gCtx.fillRect(0, 0, w, h);
+
+        const strings = 8;
+        const stepX = (w * 0.8) / (strings - 1);
+        for (let i = 0; i < strings; i++) {
+          const sx = w * 0.1 + i * stepX;
+          const vib = GameState.harp.vibrations[i] || 0;
+          const vibOffset = Math.sin(Date.now() * 0.08) * vib;
+
+          gCtx.strokeStyle = harpNotes[i].color;
+          gCtx.shadowColor = harpNotes[i].color;
+          gCtx.shadowBlur = 14 + vib * 1.2;
+          gCtx.lineWidth = 2.5;
+          gCtx.beginPath();
+          gCtx.moveTo(sx, 0);
+          gCtx.quadraticCurveTo(sx + vibOffset, h * 0.5, sx, h * 0.95);
+          gCtx.stroke();
+          gCtx.shadowBlur = 0;
+
+          gCtx.fillStyle = harpNotes[i].color;
+          gCtx.font = 'bold 11px JetBrains Mono, monospace';
+          gCtx.fillText(harpNotes[i].note, sx - 7, 24);
+        }
+
+        const hx = p.x * w;
+        const hy = p.y * h;
+        gCtx.fillStyle = '#a855f7';
+        gCtx.shadowColor = '#d8b4fe';
+        gCtx.shadowBlur = 16;
+        gCtx.beginPath();
+        gCtx.arc(hx, hy, 13, 0, Math.PI * 2);
+        gCtx.fill();
+        gCtx.shadowBlur = 0;
+
+      } else if (currentGameMode === 'fruit') {
+        const skyGrad = gCtx.createLinearGradient(0, 0, 0, h);
+        skyGrad.addColorStop(0, '#020617');
+        skyGrad.addColorStop(1, '#0f172a');
+        gCtx.fillStyle = skyGrad;
+        gCtx.fillRect(0, 0, w, h);
+
+        const fruits = GameState.fruit.items;
+        fruits.forEach(f => {
+          const fx = f.x * w;
+          const fy = f.y * h;
+          gCtx.save();
+          gCtx.translate(fx, fy);
+          gCtx.rotate(f.rot);
+
+          if (f.kind === 0) {
+            gCtx.fillStyle = '#f43f5e';
+            gCtx.beginPath();
+            gCtx.arc(0, 0, 12, 0, Math.PI * 2);
+            gCtx.fill();
+          } else if (f.kind === 1) {
+            gCtx.fillStyle = '#fde047';
+            gCtx.beginPath();
+            gCtx.arc(0, 0, 11, 0, Math.PI * 2);
+            gCtx.fill();
+          } else {
+            gCtx.fillStyle = '#10b981';
+            gCtx.beginPath();
+            gCtx.arc(0, 0, 13, 0, Math.PI * 2);
+            gCtx.fill();
+          }
+          gCtx.restore();
+        });
+
+        const bx = p.x * w;
+        const by = p.y * h;
+        gCtx.strokeStyle = '#a855f7';
+        gCtx.shadowColor = '#c084fc';
+        gCtx.shadowBlur = 14;
+        gCtx.lineWidth = 4;
+        gCtx.beginPath();
+        gCtx.arc(bx, by, 25, 0, Math.PI);
+        gCtx.stroke();
+        gCtx.shadowBlur = 0;
+      }
+
+      VisualFX.drawOverlayFX(gCtx);
+      gCtx.restore();
+    }
+
+    function animationLoop() {
+      drawTelemetryWaveforms();
+      updateGamePhysics();
+      drawGameCanvas();
+      requestAnimationFrame(animationLoop);
+    }
+
+    function setupParallaxTilt() {
+      const cards = [document.getElementById('cardDoctorPortal'), document.getElementById('cardPatientPortal')];
+      
+      cards.forEach(card => {
+        if (!card) return;
+        card.addEventListener('mousemove', (e) => {
+          const rect = card.getBoundingClientRect();
+          const x = e.clientX - rect.left;
+          const y = e.clientY - rect.top;
+          const centerX = rect.width / 2;
+          const centerY = rect.height / 2;
+          
+          const rotateX = ((y - centerY) / centerY) * -9;
+          const rotateY = ((x - centerX) / centerX) * 9;
+          
+          card.style.transform = `perspective(1000px) rotateX(${rotateX}deg) rotateY(${rotateY}deg) scale3d(1.02, 1.02, 1.02)`;
+        });
+
+        card.addEventListener('mouseleave', () => {
+          card.style.transform = 'perspective(1000px) rotateX(0deg) rotateY(0deg) scale3d(1, 1, 1)';
+        });
+      });
+    }
+
+    window.onload = function () {
+      resizeTelemetryCanvas();
+      resizeGameCanvas();
+      renderChatMessages();
+      syncHapticControlsUI();
+      updateDashboardKPIs();
+      setPaddleNormalizedX(0.5);
+      setupParallaxTilt();
+      animationLoop();
+    };
+
+    window.addEventListener('resize', () => {
+      resizeTelemetryCanvas();
+      resizeGameCanvas();
+    });
+  </script>
+</body>
+</html>
